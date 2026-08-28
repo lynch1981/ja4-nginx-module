@@ -31,17 +31,22 @@ There are two complementary suites:
 
 | Suite | Path | Framework | What it covers |
 |-------|------|-----------|----------------|
-| Test::Nginx | `test/*.t` | [Test::Nginx](https://github.com/openresty/test-nginx) + `prove` | Module load, config/variables, plain-HTTP safety, JA4H (planned) |
+| Test::Nginx | `test/*.t` | [Test::Nginx](https://github.com/openresty/test-nginx) + `prove` | Module load, plain-HTTP safety, JA4H, TLS JA4 via curlu parrots |
 | Integration / TLS | `test/*.py` | `pytest` + Docker | JA4 fingerprint goldens, ClientHello edge cases (curl, uTLS, curl_cffi) |
 
 ### Test::Nginx tests (`test/*.t`)
 
-Test::Nginx cases live under `test/*.t`. Each case embeds a small nginx config, starts nginx, issues a request with the default Test::Nginx client (Perl `IO::Socket`, plain HTTP/1.1), and asserts on the response.
+Test::Nginx cases live under `test/*.t`. Each case embeds a small nginx config, starts nginx, issues a request, and asserts on the response.
+
+- `test/plain-http-variables.t` uses the default Test::Nginx client (Perl `IO::Socket`, plain HTTP/1.1).
+- `test/tls-ja4-variables.t` uses Test::Nginx’s curl client over HTTPS. The `curl` on `PATH` must be [curlu](https://github.com/lynch1981/curlu) (install it as `curl`, or put a `curl` symlink ahead of `/usr/bin/curl`).
 
 **Requirements**
 
-- nginx built with this module (and the required core patch)
-- Perl modules: `Test::Nginx` (and dependencies)
+- nginx built with this module (and the required core patch), `http_ssl_module`, and `http_v2_module`
+- Perl modules: `Test::Nginx` (and dependencies; HTTP/2 mode needs `IPC::Run`)
+- `curl` on `PATH` is [curlu](https://github.com/lynch1981/curlu) (required for `test/tls-ja4-variables.t`)
+- TLS certs: `nginx_utils/server.crt` and `nginx_utils/server.key` (used by `test/tls-ja4-variables.t`)
 
 ```bash
 # example: local install of Test::Nginx
@@ -52,10 +57,12 @@ export PERL5LIB=$HOME/perl5/lib/perl5${PERL5LIB:+:$PERL5LIB}
 **Run**
 
 ```bash
-export TEST_NGINX_BINARY=/path/to/nginx   # binary built with this module
+export TEST_NGINX_BINARY=/path/to/nginx   # binary built with this module + HTTP/2
+# curl on PATH must be curlu (test/tls-ja4-variables.t)
 prove -v test/*.t
 # or a single file:
 prove -v test/plain-http-variables.t
+prove -v test/tls-ja4-variables.t
 ```
 
 `TEST_NGINX_SERVROOT` is optional. Each `.t` file defaults it to `test/servroot` so Test::Nginx does not write `t/servroot`. Set the variable only if you need a different path.
@@ -69,6 +76,7 @@ TEST_NGINX_VERBOSE=1 prove -v test/plain-http-variables.t
 Current files:
 
 - `test/plain-http-variables.t` — module loads (`$http_ssl_ja4h`), SSL JA4 vars empty and safe on plain HTTP
+- `test/tls-ja4-variables.t` — TLS JA4 / JA4_string / JA4one from curlu parrots (ALPN, ECH/ALPS, SNI)
 
 Runtime tree `test/servroot/` is created by Test::Nginx and is gitignored.
 
