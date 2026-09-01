@@ -4,7 +4,8 @@
 # Client: Test::Nginx default (Perl IO::Socket, plain HTTP/1.1).
 # Scope: module load, plain-HTTP safety when JA4 variables are referenced,
 #        JA4H HTTP-layer fields (method, Cookie, Referer, Accept-Language),
-#        JA4H goldens from FoxIO rust/ja4/src/http.rs (comma-join, hash12 zeros).
+#        JA4H goldens from FoxIO rust/ja4/src/http.rs (comma-join, hash12 zeros)
+#        and FoxIO Wireshark packet-ja4.c http_method_map (method codes).
 # Not covered here: TLS ClientHello / JA4 golden fingerprints (see test/*.py).
 #
 # Run (requires nginx built with this module + Test::Nginx):
@@ -136,7 +137,7 @@ GET /t
 
 
 === TEST 7: ja4h_post
-# First two letters of POST, lowercased. Do not pin header count:
+# JA4H method map: POST -> po. Do not pin header count:
 # Test::Nginx may add Content-Length for the body.
 --- config
     location /t {
@@ -452,5 +453,315 @@ X-18: 1
 GET /t
 --- response_body_like chomp
 ^ja4h=ge11nn210000_e46fbdfb6ecf_000000000000_000000000000$
+--- no_error_log
+[error]
+
+
+
+=== TEST 24: ja4h_string_cookie_name_prefix_sort
+# Sort by cookie name, not the full pair. Cookie: a-b=1; a=2
+# Pair-sort would emit a-b,a because '-' < '='; name-sort emits a,a-b.
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h_string=$http_ssl_ja4h_string\n";
+    }
+--- more_headers
+Cookie: a-b=1; a=2
+--- request
+GET /t
+--- response_body_like chomp
+^ja4h_string=ge11cn020000_Host,Connection_a,a-b_a=2,a-b=1$
+--- no_error_log
+[error]
+
+
+
+=== TEST 25: ja4h_spec_cookie_name_prefix_sort
+# Same cookies as TEST 24, hashed: hash12("a,a-b") / hash12("a=2,a-b=1").
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- more_headers
+Cookie: a-b=1; a=2
+--- request
+GET /t
+--- response_body_like chomp
+^ja4h=ge11cn020000_d5c75abc5c2c_474f0429a83d_8777147329fe$
+--- no_error_log
+[error]
+
+
+
+=== TEST 26: ja4h_msearch
+# JA4H map: M-SEARCH -> ms (not first two chars "m-"). Nginx parses
+# hyphenated methods as NGX_HTTP_UNKNOWN; lookup uses method_name.
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+M-SEARCH /t
+--- response_body_like chomp
+^ja4h=ms11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 27: ja4h_unknown_method
+# Unknown but legal method FOO -> 00 (not first two chars "fo").
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+FOO /t
+--- response_body_like chomp
+^ja4h=0011nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 28: ja4h_mkcol
+# JA4H map: MKCOL -> ml (not first two chars "mk").
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+MKCOL /t
+--- response_body_like chomp
+^ja4h=ml11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 29: ja4h_copy
+# JA4H map: COPY -> cy (not first two chars "co").
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+COPY /t
+--- response_body_like chomp
+^ja4h=cy11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 30: ja4h_purge
+# JA4H map: PURGE -> pr (not "pu"; PUT is pu).
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+PURGE /t
+--- response_body_like chomp
+^ja4h=pr11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 31: ja4h_propfind
+# JA4H map: PROPFIND -> pf (not "pr").
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+PROPFIND /t
+--- response_body_like chomp
+^ja4h=pf11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 32: ja4h_proppatch
+# JA4H map: PROPPATCH -> pp (not "pr").
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+PROPPATCH /t
+--- response_body_like chomp
+^ja4h=pp11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 33: ja4h_checkin
+# JA4H map: CHECKIN -> cn (not "ch").
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+CHECKIN /t
+--- response_body_like chomp
+^ja4h=cn11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 34: ja4h_checkout
+# JA4H map: CHECKOUT -> ct (not "ch").
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+CHECKOUT /t
+--- response_body_like chomp
+^ja4h=ct11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 35: ja4h_report
+# JA4H map: REPORT -> rp (not "re").
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+REPORT /t
+--- response_body_like chomp
+^ja4h=rp11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 36: ja4h_unlock
+# JA4H map: UNLOCK -> uo (not "un").
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+UNLOCK /t
+--- response_body_like chomp
+^ja4h=uo11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 37: ja4h_unlink
+# JA4H map: UNLINK -> ui (not "un").
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+UNLINK /t
+--- response_body_like chomp
+^ja4h=ui11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 38: ja4h_mkactivity
+# JA4H map: MKACTIVITY -> ma (not "mk"; MKCOL is ml).
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+MKACTIVITY /t
+--- response_body_like chomp
+^ja4h=ma11nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 39: ja4h_unknown_one_char
+# One-character method is parseable; must emit 00, not decline the fingerprint.
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+A /t
+--- response_body_like chomp
+^ja4h=0011nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 40: ja4h_unknown_prefix
+# GETS must not match GET by prefix.
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+GETS /t
+--- response_body_like chomp
+^ja4h=0011nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 41: ja4h_unknown_hyphen
+# FOO-BAR is parseable (hyphen allowed) but not in the map; 00 not "fo".
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+FOO-BAR /t
+--- response_body_like chomp
+^ja4h=0011nn
+--- no_error_log
+[error]
+
+
+
+=== TEST 42: ja4h_unknown_underscore
+# Underscore is parseable; FOO_BAR is not in the map.
+--- config
+    location /t {
+        default_type text/plain;
+        return 200 "ja4h=$http_ssl_ja4h\n";
+    }
+--- request
+FOO_BAR /t
+--- response_body_like chomp
+^ja4h=0011nn
 --- no_error_log
 [error]

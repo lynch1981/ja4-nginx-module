@@ -86,9 +86,9 @@ typedef struct ngx_ssl_ja4h_s
     char cookie_value_hash[13]; // 12 characters for truncated sha256 hash of cookie fields+values + null terminator
 
     // Raw data fields for the -r and -o options
-    char *raw_http_headers;  // Dynamically allocated string for raw HTTP headers
-    char *raw_cookie_fields; // Dynamically allocated string for raw cookie fields
-    char *raw_cookie_values; // Dynamically allocated string for raw cookie field values
+    ngx_str_t raw_http_headers;  // comma-joined header names, Cookie/Referer dropped
+    ngx_str_t raw_cookie_fields; // comma-joined cookie names, sorted
+    ngx_str_t raw_cookie_pairs;  // comma-joined cookie name=value pairs, sorted
 } ngx_ssl_ja4h_t;
 
 typedef struct ngx_ssl_ja4t_s
@@ -239,13 +239,6 @@ static int compare_hexes(const void *a, const void *b)
     if (hex_a > hex_b)
         return 1;
     return 0;
-}
-
-static int ngx_libc_cdecl compare_ngx_str(const void *one, const void *two)
-{
-    ngx_str_t *a = (ngx_str_t *) one;
-    ngx_str_t *b = (ngx_str_t *) two;
-    return ngx_strncasecmp(a->data, b->data, a->len);
 }
 
 #if (NGX_DEBUG)
@@ -417,10 +410,8 @@ static ngx_int_t ngx_http_ssl_ja4s_string(ngx_http_request_t *r, ngx_http_variab
 
 // JA4H
 int ngx_ssl_ja4h(ngx_http_request_t *r, ngx_pool_t *pool, ngx_ssl_ja4h_t *ja4h);
-void ngx_ssl_ja4h_fp(ngx_pool_t *pool, ngx_ssl_ja4h_t *ja4h, ngx_str_t *out);
 static ngx_int_t ngx_http_ssl_ja4h(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 // JA4H STRING
-void ngx_ssl_ja4h_fp_string(ngx_pool_t *pool, ngx_ssl_ja4h_t *ja4h, ngx_str_t *out);
 static ngx_int_t ngx_http_ssl_ja4h_string(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 
 // JA4T
