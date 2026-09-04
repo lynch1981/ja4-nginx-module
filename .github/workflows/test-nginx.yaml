@@ -8,8 +8,9 @@ jobs:
     timeout-minutes: 30
 
     env:
-      NGINX_VERSION: "1.30.4"
+      NGINX_VERSION: "1.31.4"
       BUILD_DIR: /tmp/build
+      ASAN_OPTIONS: detect_leaks=0
 
     steps:
       - name: Checkout
@@ -26,6 +27,7 @@ jobs:
             perl \
             cpanminus \
             wget \
+            git \
             patch
           sudo cpanm --notest Test::Nginx
 
@@ -37,23 +39,38 @@ jobs:
           wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
           tar -zxf "nginx-${NGINX_VERSION}.tar.gz"
 
-      - name: Apply nginx.patch
+      - name: Clone no-pool-nginx
         run: |
           set -euo pipefail
-          patch -p1 -d "${BUILD_DIR}/nginx-${NGINX_VERSION}" \
+          git clone --depth=1 https://github.com/openresty/no-pool-nginx.git \
+            "${BUILD_DIR}/no-pool-nginx"
+
+      - name: Apply patches
+        run: |
+          set -euo pipefail
+          nginx_src="${BUILD_DIR}/nginx-${NGINX_VERSION}"
+          no_pool="${BUILD_DIR}/no-pool-nginx/nginx-${NGINX_VERSION}-no_pool.patch"
+          if [ ! -f "${no_pool}" ]; then
+            echo "::error::no-pool patch not found: ${no_pool}"
+            exit 1
+          fi
+          patch -p1 -d "${nginx_src}" < "${no_pool}"
+          patch -p1 -d "${nginx_src}" \
             < "${GITHUB_WORKSPACE}/patches/nginx.patch"
 
-      - name: Build nginx with JA4 module
+      - name: Build nginx with JA4 module (ASan)
         run: |
           set -euo pipefail
           cd "${BUILD_DIR}/nginx-${NGINX_VERSION}"
           ./configure \
             --with-debug \
+            --with-cc-opt="-O1 -g -fno-omit-frame-pointer -fsanitize=address" \
+            --with-ld-opt="-fsanitize=address" \
             --add-module="${GITHUB_WORKSPACE}" \
             --with-http_ssl_module
           make -j"$(nproc)"
 
       - name: Run Test::Nginx
         run: |
-          export TEST_NGINX_BINARY="${BUILD_DIR}/nginx-${NGINX_VERSION}/objs/nginx"
+          export PATH="${BUILD_DIR}/nginx-${NGINX_VERSION}/objs:${PATH}"
           prove -v test/*.t
