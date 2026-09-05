@@ -58,14 +58,14 @@ jobs:
           patch -p1 -d "${nginx_src}" \
             < "${GITHUB_WORKSPACE}/patches/nginx.patch"
 
-      - name: Build nginx with JA4 module (ASan)
+      - name: Build nginx with JA4 module (ASan+bounds)
         run: |
           set -euo pipefail
           cd "${BUILD_DIR}/nginx-${NGINX_VERSION}"
           ./configure \
             --with-debug \
-            --with-cc-opt="-O1 -g -fno-omit-frame-pointer -fsanitize=address" \
-            --with-ld-opt="-fsanitize=address" \
+            --with-cc-opt="-O1 -g -fno-omit-frame-pointer -fsanitize=address,bounds -fno-sanitize-recover=bounds" \
+            --with-ld-opt="-fsanitize=address,bounds" \
             --add-module="${GITHUB_WORKSPACE}" \
             --with-http_ssl_module
           make -j"$(nproc)"
