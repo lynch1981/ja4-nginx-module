@@ -6,6 +6,7 @@
 #include <openssl/sha.h>
 #include <stdint.h>
 #include "ngx_http_ssl_ja4_module.h"
+#include "ngx_http_ssl_ja4_hello.h"
 
 static void ngx_ssl_ja4h_fp(ngx_pool_t *pool, ngx_ssl_ja4h_t *ja4h,
     ngx_str_t *out);
@@ -1973,6 +1974,8 @@ ngx_http_ssl_ja4_init(ngx_conf_t *cf)
 
     vars_len = (sizeof(ngx_http_ssl_ja4_variables_list) /
                 sizeof(ngx_http_ssl_ja4_variables_list[0]));
+
+    ngx_ssl_client_hello_parser = ngx_ssl_parse_client_hello_extensions;
 
     /* Register variables */
     for (l = 0; l < vars_len; ++l)

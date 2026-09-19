@@ -37,6 +37,7 @@ RUN wget https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_
 
 COPY config /tmp/ja4-nginx-module/config
 COPY src/ngx_http_ssl_ja4_module.c.dummy /tmp/ja4-nginx-module/src/ngx_http_ssl_ja4_module.c
+COPY src/ngx_http_ssl_ja4_hello.c.dummy /tmp/ja4-nginx-module/src/ngx_http_ssl_ja4_hello.c
 
 WORKDIR /tmp/nginx-${NGINX_VERSION}
 RUN ./configure \
