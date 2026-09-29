@@ -1,0 +1,117 @@
+# SYN-ACK capture tests
+
+Three privileged suites cover the `ebpf/` addon. Missing dependencies,
+load/verifier failures, and assertion failures are errors; there are no
+successful skips. Run them sequentially: `nginx.py` checks system-wide BPF
+resource IDs for leaks.
+
+Dependencies: root, kernel BTF, libbpf 1.3+, Python 3.9+, iproute2, util-linux
+(`nsenter`), nftables and Test::Nginx. No BPF compiler is needed: the suites use
+the object embedded in the committed `ebpf/ngx_ebpf.skel.h`. `nginx.py` also
+needs `bpftool`, to list the maps and links nginx creates; set `BPFTOOL` to the
+real executable when the distro wrapper expects a tools package matching the
+running kernel. On Ubuntu 24.04, install `libbpf-dev libelf-dev iproute2
+nftables linux-tools-generic`.
+
+## Build
+
+Build Nginx with all three patches and both addons. `nginx.py` needs its own
+instrumented build: add `--with-cc-opt=-DNGX_SYNACK_TEST=1`. The test define
+enables raw-header inspection and fault injection without adding production
+variables.
+`nginx.py` checks `nginx -V` first and exits with the missing option if the
+build doesn't qualify. Use a separate build for deployment; production does
+not recognize `NGX_SYNACK_TEST_ALLOC_FAIL`.
+
+```sh
+sudo -E prove -v --exec python3 test/ebpf/capture.py
+sudo -E env JA4TS_REQUIRE_CAPTURE_TESTS=1 \
+    TEST_NGINX_BINARY=/path/to/nginx/objs/nginx \
+    prove -v test/ja4ts-variables.t test/ja4ts-network.t
+sudo -E prove -v --exec python3 test/ebpf/nginx.py :: /path/to/instrumented/nginx
+sh test/ebpf/build-matrix.sh /path/to/nginx-1.31.4.tar.gz /tmp/new-build-matrix
+```
+
+Preserve `PERL5LIB` with `sudo -E` if Test::Nginx was installed locally, and
+include `/usr/sbin` in PATH. `nginx.py` also needs a `nobody:nogroup` account and permission to drop
+privileges. Use a short, world-traversable build and servroot path: unix-socket
+paths are limited to 108 bytes, and unprivileged workers must reach the binary.
+
+`capture.py` and `nginx.py` print TAP, so `prove` runs them like the `.t` files
+(they also run directly with `python3`). Each case is one `ok`/`not ok` line,
+with the traceback as `#` diagnostics. A failed `capture.py` case does not stop
+the others. In `nginx.py`, a failed `test_http` phase skips the later phases
+that depend on it, but the shutdown check still runs. A wrong environment (not
+root, or an nginx build without the addon or the instrumentation) ends in
+`Bail out!`.
+
+`fixture.py` is shared by `capture.py` and `nginx.py`, and is not a runner. It
+provides private network namespaces, owned nftables tables, a remote backend in
+its own namespace, and a libbpf loader. It never creates named namespaces or
+pins, and links and maps are released by descriptor closure.
+
+## Coverage
+
+Each case belongs to the lowest layer that can observe it.
+
+- **`capture.py`: the collector, driven directly.** It extracts the object
+  embedded in the committed skeleton, exactly what nginx ships, loads it with
+  small test map capacities and reports 29 TAP points: 28 cases plus the remote
+  namespace setup:
+  - crafted packets: payload exclusion, IPv4 options, IPv6 extension limits,
+    fragments, jumbograms, ESP, bad TCP offsets, and RST
+  - deadlines, SYN-data ACK misses, retransmission alias retention,
+    terminal state, colliding ownership, and ACK wraparound
+  - exhaustion of all three bounded maps
+  - real TCP to a backend in a separate namespace: IPv4, IPv6, an IPv4-mapped
+    socket, untracked traffic, and DNAT/SNAT
+  Nginx cannot produce these packets or map states. Run the **same object** on
+  each target kernel to check CO-RE relocation.
+- **`ja4ts-config.t`: directive parsing, without root.** It runs against the
+  SYN-ACK patch both with and without the addon, and covers:
+  - invalid values, and the main and `upstream` contexts
+  - `$upstream_ja4ts` existing and empty with capture unset or off
+  - `tcp_save_synack on` failing without the addon (skipped on ebpf builds)
+  - rejection in `stream {}` (skipped without `--with-stream`)
+  - `tcp_save_synack on` failing clearly without BPF privileges (runs on ebpf
+    builds when not root)
+- **`ja4ts-variables.t`: JA4TS behaviour through Nginx.** It has 144 assertions,
+  over loopback IPv4, covering:
+  - capture policy and inheritance
+  - golden fingerprints for option layouts
+  - plain and TLS upstreams, including a failed upstream TLS handshake
+  - retries, refused connections and unix sockets
+  - the log phase and early evaluation
+  - keepalive reuse across enabled and disabled locations
+  - `error_page` into a disabled location
+- **`ja4ts-network.t`: network paths through Nginx.** It has 61 assertions
+  covering:
+  - IPv6
+  - DNAT, SNAT, REDIRECT and their combinations, including IPv6 and a
+    non-local address
+  - NATed and direct connections in turn
+  - later PREROUTING rewrites and untracked traffic
+  Both files share `test/lib/Ja4tsCapture.pm`: the private namespace and the
+  `--- synack`, `--- nat`, `--- prerouting` and `--- notrack` sections.
+- **`nginx.py`: white-box lifecycle through Nginx.** It covers:
+  - default-off and `-t`/`-s` resource behavior
+  - no BPF resources leaked by a startup that fails without privileges
+  - unprivileged workers
+  - atomic handoff before response variables, checked in the maps
+  - allocation and registration failure, and aborted-connect cleanup
+  - lease takeover after a worker is killed
+  - reload policy and resource reuse
+  - final map and link release
+- **`build-matrix.sh`: production builds.** It builds HTTP, HTTP plus stream,
+  and capture-disabled trees from fresh sources.
+
+## Boundaries
+
+nginx does not use TCP Fast Open upstream, so a SYN-ACK acknowledging SYN data
+does not match.
+Earlier XDP/TC/OUTPUT/other-namespace rewrites cannot be recovered. Headers
+outside the linear skb head are not read. There is no stream capture, no
+retransmission-time/RST suffix, and no live binary upgrade handover in this
+version. Privileged CI errors instead of silently skipping capture coverage.
+Rerun `capture.py` unchanged on both supported baseline kernels when changing
+CO-RE accesses or packet reads.

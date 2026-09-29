@@ -1,0 +1,169 @@
+name: eBPF
+
+# Upstream SYN-ACK capture ($upstream_ja4ts): the ebpf addon, its patch and
+# tests. Runs only when something the capture depends on changes.
+on:
+  pull_request:
+    paths:
+      - "ebpf/**"
+      - "patches/**"
+      - "src/**"
+      - "config"
+      - "test/ebpf/**"
+      - "test/ja4ts-*.t"
+      - "test/lib/**"
+      - ".github/workflows/test-ebpf.yaml"
+  workflow_dispatch:
+
+env:
+  NGINX_VERSION: "1.31.4"
+  BUILD_DIR: /tmp/ebpf-ci
+
+jobs:
+  skeleton:
+    name: Committed BPF skeleton is current
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare ngx_ebpf.skel.h with its inputs
+        run: sh ebpf/gen-skel.sh --check
+
+  build:
+    name: Build instrumented nginx
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          # No BPF toolchain: nginx compiles the committed ngx_ebpf.skel.h.
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libpcre2-dev libssl-dev zlib1g-dev pkg-config \
+            libbpf-dev libelf-dev curl patch
+      - name: Build nginx with the ebpf addon and test instrumentation
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUILD_DIR/src"
+          curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+            | tar -xz --strip-components=1 -C "$BUILD_DIR/src"
+          cd "$BUILD_DIR/src"
+          for name in nginx nginx-tcp-save-syn nginx-tcp-save-synack; do
+            patch -p1 < "$GITHUB_WORKSPACE/patches/$name.patch"
+          done
+          ./configure --with-debug --with-cc-opt=-DNGX_SYNACK_TEST=1 \
+            --with-http_ssl_module --with-http_v2_module \
+            --with-stream --with-stream_ssl_module \
+            --add-module="$GITHUB_WORKSPACE/ebpf" --add-module="$GITHUB_WORKSPACE"
+          make -j"$(nproc)"
+          ./objs/nginx -V
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nginx-instrumented
+          path: ${{ env.BUILD_DIR }}/src/objs/nginx
+          retention-days: 1
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ebpf-build-logs
+          path: ${{ env.BUILD_DIR }}/src/objs/autoconf.err
+
+  privileged:
+    name: Capture, JA4TS and lifetime (root)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libbpf1 python3 perl cpanminus iproute2 nftables util-linux \
+            linux-tools-generic linux-tools-common
+          sudo cpanm --notest Test::Nginx
+          # nginx.py lists BPF maps and links with bpftool. Use the real
+          # executable: the wrapper requires a tools package matching the
+          # runner's kernel even though bpftool itself does not.
+          for candidate in /usr/lib/linux-tools/*/bpftool; do
+            if [ -x "$candidate" ]; then
+              echo "BPFTOOL=$candidate" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: nginx-instrumented
+          path: ${{ env.BUILD_DIR }}
+      - name: Restore the executable bit lost by the artifact
+        run: chmod 755 "$BUILD_DIR" "$BUILD_DIR/nginx"
+      - name: Production collector
+        run: sudo -E prove -v --exec python3 test/ebpf/capture.py
+      - name: JA4TS variables and network paths
+        run: |
+          sudo -E env JA4TS_REQUIRE_CAPTURE_TESTS=1 \
+            TEST_NGINX_BINARY="$BUILD_DIR/nginx" \
+            TEST_NGINX_SERVROOT="$BUILD_DIR/servroot" \
+            prove -v test/ja4ts-variables.t test/ja4ts-network.t
+      - name: Nginx lifetime and resource release
+        run: |
+          sudo -E prove -v --exec python3 test/ebpf/nginx.py :: "$BUILD_DIR/nginx"
+
+  unprivileged:
+    name: Configuration without BPF privileges
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libbpf1 perl cpanminus
+          sudo cpanm --notest Test::Nginx
+      - uses: actions/download-artifact@v4
+        with:
+          name: nginx-instrumented
+          path: ${{ env.BUILD_DIR }}
+      - name: Restore the executable bit lost by the artifact
+        run: chmod 755 "$BUILD_DIR" "$BUILD_DIR/nginx"
+      # As the runner user an enabled start must fail clearly (TEST 7), and
+      # the stream module is present for the stream-context check (TEST 6).
+      - name: ja4ts-config.t as a normal user
+        run: TEST_NGINX_BINARY="$BUILD_DIR/nginx" prove -v test/ja4ts-config.t
+
+  build-matrix:
+    name: Production HTTP, HTTP+stream and capture-disabled builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libpcre2-dev libssl-dev zlib1g-dev pkg-config \
+            libbpf-dev libelf-dev curl patch perl cpanminus
+          sudo cpanm --notest Test::Nginx
+      - name: Build and configure-test each variant
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUILD_DIR"
+          curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+            -o "$BUILD_DIR/nginx.tar.gz"
+          JOBS="$(nproc)" sh test/ebpf/build-matrix.sh "$BUILD_DIR/nginx.tar.gz" "$BUILD_DIR/matrix"
+      # The SYN-ACK patch without the addon: `on` must fail with the build
+      # requirement (TEST 5); the build has stream, so TEST 6 runs too.
+      - name: ja4ts-config.t on the capture-disabled build
+        run: |
+          TEST_NGINX_BINARY="$BUILD_DIR/matrix/disabled/objs/nginx" prove -v test/ja4ts-config.t
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ebpf-matrix-logs
+          path: |
+            ${{ env.BUILD_DIR }}/matrix/*.log
+            ${{ env.BUILD_DIR }}/matrix/*/objs/autoconf.err

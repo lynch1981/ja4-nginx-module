@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""Exercise the production collector with bounded maps and raw test packets.
+
+Loads the BPF object embedded in the committed ebpf/ngx_ebpf.skel.h, i.e.
+exactly what nginx ships. Requires root. Everything runs in an anonymous,
+private network namespace. Map resizing is test-only; production defaults are
+defined in ngx_ebpf.h.
+"""
+import ctypes as C
+import errno
+import os
+import socket
+import struct
+import sys
+import time
+
+from fixture import Loader, Tap, Tuple, namespace, remote_backend, rules, skeleton_object
+
+
+class Connection(C.Structure):
+    _fields_ = [("deadline", C.c_uint64), ("phase", C.c_uint32),
+                ("count", C.c_uint32), ("keys", Tuple * 2)]
+
+
+class Expectation(C.Structure):
+    _fields_ = [("cookie", C.c_uint64), ("deadline", C.c_uint64),
+                ("ambiguous", C.c_uint32), ("pad", C.c_uint32)]
+
+
+class Record(C.Structure):
+    _fields_ = [("version", C.c_uint32), ("length", C.c_uint32),
+                ("timestamp", C.c_uint64), ("headers", C.c_ubyte * 256)]
+
+
+def key(family=2, src="127.0.0.2", dst="127.0.0.1", sport=23456,
+        dport=54321, ack=42):
+    k = Tuple(family=family, protocol=6, sport=socket.htons(sport),
+              dport=socket.htons(dport), ack=socket.htonl(ack))
+    source, dest = socket.inet_pton(family, src), socket.inet_pton(family, dst)
+    k.src[:len(source)], k.dst[:len(dest)] = source, dest
+    return k
+
+
+def packet(k, *, flags=0x12, seq=100, payload=b"", extensions=0,
+           fragment=False, jumbo=False, next_header=None, tcp_offset=5):
+    tcp = struct.pack("!HHIIBBHHH", socket.ntohs(k.sport), socket.ntohs(k.dport),
+                      seq, socket.ntohl(k.ack), tcp_offset << 4, flags, 8192, 0, 0)
+    if k.family == 2:
+        return struct.pack("!BBHHHBBH4s4s", 0x45, 0, 40 + len(payload), 123,
+                           0x2000 if fragment else 0, 64, 6, 0,
+                           bytes(k.src[:4]), bytes(k.dst[:4])) + tcp + payload
+    ext = b""
+    for i in range(extensions):
+        ext += bytes([60 if i+1 < extensions else 6, 0]) + bytes(6)
+    nxt = 60 if extensions else 6
+    if fragment:
+        nxt, ext = 44, bytes([6, 0, 0, 0, 0, 0, 0, 1])
+    if next_header is not None:
+        nxt = next_header
+    size = 0 if jumbo else len(ext) + len(tcp) + len(payload)
+    return struct.pack("!IHBB16s16s", 6 << 28, size, nxt, 64,
+                       bytes(k.src), bytes(k.dst)) + ext + tcp + payload
+
+
+class Collector:
+    def __init__(self, path, tap):
+        self.tap = tap
+        self.proof = Loader(path, programs=(b"synack_in", b"synack_out"),
+                           map_name=b"synack_conn", capacities={
+                               b"synack_conn": 16, b"synack_expect": 32,
+                               b"synack_capture": 2})
+        self.lib = self.proof.lib
+        self.fds = {name: self.lib.bpf_object__find_map_fd_by_name(self.proof.obj,
+                    ("synack_" + name).encode()) for name in ("conn", "expect", "capture", "stats")}
+        self.raw = {family: socket.socket(family, socket.SOCK_RAW, socket.IPPROTO_RAW)
+                    for family in (2, 10)}
+        self.raw[10].setsockopt(socket.IPPROTO_IPV6, 36, 1)  # IPV6_HDRINCL
+        self.serial = 1 << 60
+
+    def close(self):
+        for s in self.raw.values():
+            s.close()
+        self.proof.close()
+
+    def put(self, name, k, value, flags=0):
+        rc = self.lib.bpf_map_update_elem(self.fds[name], C.byref(k), C.byref(value), flags)
+        if rc:
+            raise OSError(C.get_errno(), f"update {name}")
+
+    def get(self, name, k, cls, consume=False):
+        value = cls()
+        fn = self.lib.bpf_map_lookup_and_delete_elem if consume else self.lib.bpf_map_lookup_elem
+        if fn(self.fds[name], C.byref(k), C.byref(value)):
+            if C.get_errno() == errno.ENOENT:
+                return None
+            raise OSError(C.get_errno(), f"lookup {name}")
+        return value
+
+    def delete(self, name, k):
+        rc = self.lib.bpf_map_delete_elem(self.fds[name], C.byref(k))
+        assert not rc or C.get_errno() == errno.ENOENT
+
+    def counter(self, number):
+        return self.get("stats", C.c_uint32(number), C.c_uint64).value
+
+    def register(self, k=None, cookie=None, expired=False):
+        self.serial += 1
+        cookie = C.c_uint64(cookie or self.serial)
+        deadline = time.monotonic_ns() + (-1 if expired else 120_000_000_000)
+        state = Connection(deadline=deadline)
+        if k is not None:
+            state.keys[0], state.count = k, 1
+        self.put("conn", cookie, state)
+        if k is not None:
+            self.put("expect", k, Expectation(cookie.value, deadline))
+        return cookie
+
+    def clean(self, cookie):
+        state = self.get("conn", cookie, Connection)
+        if state:
+            for k in state.keys[:state.count]:
+                self.delete("expect", k)
+        self.delete("conn", cookie)
+        self.delete("capture", cookie)
+
+    def send(self, k, data):
+        n = 4 if k.family == 2 else 16
+        self.raw[k.family].sendto(data, (socket.inet_ntop(k.family, bytes(k.dst[:n])), 0))
+        # Raw send completion does not imply PREROUTING has run. In particular,
+        # slow software-emulated guests can defer loopback RX to ksoftirqd.
+        time.sleep(0.03)
+
+    def capture_case(self, name, k, data, length=None, expired=False):
+        with self.tap.case(name):
+            cookie = self.register(k, expired=expired)
+            try:
+                self.send(k, data)
+                record = self.get("capture", cookie, Record, consume=True)
+                if length is None:
+                    assert record is None, name
+                    assert self.get("conn", cookie, Connection).phase == 0, name
+                else:
+                    assert record and record.version == 1 and record.length == length, (
+                        name, "record", record, "phase", self.get("conn", cookie, Connection).phase,
+                        "expectation", self.get("expect", k, Expectation))
+                    assert bytes(record.headers[length:]) == bytes(256-length), name
+                    # IPv4 raw sends cause the kernel to fill the IP checksum.
+                    off = 20 if k.family == 2 else 0
+                    assert bytes(record.headers[off:length]) == data[off:length], name
+                    assert self.get("expect", k, Expectation) is None, name
+                    assert self.get("conn", cookie, Connection).phase == 2, name
+                    self.send(k, data)
+                    assert self.get("capture", cookie, Record) is None, name + " recreated after consumption"
+            finally:
+                self.clean(cookie)
+
+    def synack_lifecycle(self):
+        raw_cookie = int.from_bytes(self.raw[2].getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
+        cookie = self.register(cookie=raw_cookie)
+        outgoing = key(src="127.0.0.2", dst="127.0.0.1", sport=40100, dport=40101, ack=0)
+        reply = key(src="127.0.0.1", dst="127.0.0.2", sport=40101, dport=40100, ack=101)
+        try:
+            # Wire tuple plus the raw socket's own tuple: exactly two keys.
+            self.send(outgoing, packet(outgoing, flags=2))
+            state = self.get("conn", cookie, Connection)
+            assert state.count == 2, state.count
+            # nginx never sends SYN data upstream: a SYN carrying data adds no
+            # S+1+N key, and a SYN-ACK acknowledging the data does not match.
+            self.send(outgoing, packet(outgoing, flags=2, payload=b"hello"))
+            assert self.get("conn", cookie, Connection).count == 2
+            data_ack = key(src="127.0.0.1", dst="127.0.0.2", sport=40101, dport=40100, ack=106)
+            self.send(data_ack, packet(data_ack))
+            assert self.get("capture", cookie, Record) is None
+            # A retransmitted SYN keeps the same keys and refreshes their deadlines.
+            self.send(outgoing, packet(outgoing, flags=2))
+            newer = self.get("conn", cookie, Connection)
+            assert newer.count == 2 and bytes(newer.keys) == bytes(state.keys)
+            for k in newer.keys:
+                assert self.get("expect", k, Expectation).deadline == newer.deadline
+            # A SYN with another sequence number cannot add more aliases.
+            previous = self.counter(1)
+            self.send(outgoing, packet(outgoing, flags=2, seq=999))
+            assert self.get("conn", cookie, Connection).count == 2
+            assert self.counter(1) > previous
+            self.send(reply, packet(reply))
+            assert self.get("capture", cookie, Record, consume=True)
+            # Terminal state: nothing is captured again after the handoff.
+            self.send(outgoing, packet(outgoing, flags=2))
+            self.send(reply, packet(reply))
+            assert self.get("capture", cookie, Record) is None
+        finally:
+            self.clean(cookie)
+
+    def tcp_case(self, name, address, expected_source, aliases):
+        with self.tap.case("production " + name):
+            family = socket.AF_INET6 if ":" in address else socket.AF_INET
+            with socket.socket(family, socket.SOCK_STREAM) as client:
+                if family == socket.AF_INET6:
+                    # IPv4-mapped destinations send IPv4 packets from this socket.
+                    client.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                client.settimeout(3)
+                value = int.from_bytes(client.getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
+                cookie = self.register(cookie=value)
+                try:
+                    client.connect((address, 23456))
+                    record = self.get("capture", cookie, Record, consume=True)
+                    assert record and record.version == 1, name
+                    data = bytes(record.headers[:record.length])
+                    # The packet family decides the header layout, not the socket.
+                    ipv4 = data[0] >> 4 == 4
+                    source = data[12:16] if ipv4 else data[8:24]
+                    expected = socket.AF_INET if ipv4 else socket.AF_INET6
+                    assert source == socket.inet_pton(expected, expected_source), name
+                    state = self.get("conn", cookie, Connection)
+                    assert state.phase == 2 and state.count == aliases, (name, state.count)
+                    for k in state.keys[:state.count]:
+                        assert self.get("expect", k, Expectation) is None, name
+                finally:
+                    self.clean(cookie)
+
+    def remote(self):
+        with remote_backend():
+            self.tcp_case("remote IPv4", "192.0.2.2", "192.0.2.2", 1)
+            self.tcp_case("remote IPv6", "2001:db8:1::2", "2001:db8:1::2", 1)
+            self.tcp_case("remote IPv4-mapped socket", "::ffff:192.0.2.2", "192.0.2.2", 1)
+            with rules("chain out { type filter hook output priority raw; notrack; }\n"
+                       "chain pre { type filter hook prerouting priority raw; notrack; }"):
+                self.tcp_case("remote IPv4 untracked", "192.0.2.2", "192.0.2.2", 1)
+                self.tcp_case("remote IPv6 untracked", "2001:db8:1::2", "2001:db8:1::2", 1)
+            for name, address, original, out, post in [
+                ("remote DNAT", "198.51.100.9", "192.0.2.2",
+                 "ip daddr 198.51.100.9 tcp dport 23456 dnat ip to 192.0.2.2:23456", ""),
+                ("remote SNAT", "192.0.2.2", "192.0.2.2", "",
+                 "ip daddr 192.0.2.2 tcp dport 23456 snat ip to 192.0.2.1:34569"),
+                ("remote DNAT+SNAT", "198.51.100.10", "192.0.2.2",
+                 "ip daddr 198.51.100.10 tcp dport 23456 dnat ip to 192.0.2.2:23456",
+                 "ip daddr 192.0.2.2 tcp dport 23456 snat ip to 192.0.2.1:34570"),
+                ("remote IPv6 DNAT+SNAT", "2001:db8:2::9", "2001:db8:1::2",
+                 "ip6 daddr 2001:db8:2::9 tcp dport 23456 dnat ip6 to [2001:db8:1::2]:23456",
+                 "ip6 daddr 2001:db8:1::2 tcp dport 23456 snat ip6 to [2001:db8:1::1]:34571"),
+            ]:
+                body = ""
+                if out:
+                    body += f"chain out {{ type nat hook output priority dstnat; {out}; }}\n"
+                if post:
+                    body += f"chain post {{ type nat hook postrouting priority srcnat; {post}; }}\n"
+                with rules(body):
+                    self.tcp_case(name, address, original, 2)
+
+    def collisions(self):
+        outgoing = key(src="127.0.0.2", dst="127.0.0.1", sport=40200, dport=40201, ack=0)
+        reply = key(src="127.0.0.1", dst="127.0.0.2", sport=40201, dport=40200, ack=101)
+        first = self.register(reply)
+        raw_cookie = int.from_bytes(self.raw[2].getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
+        second = self.register(cookie=raw_cookie)
+        try:
+            before = self.counter(2)
+            self.send(outgoing, packet(outgoing, flags=2))
+            conflict = self.get("expect", reply, Expectation)
+            assert conflict.cookie == first.value and conflict.ambiguous == 1
+            assert self.counter(2) > before
+            self.send(reply, packet(reply))
+            assert self.get("capture", first, Record) is None
+            assert self.get("capture", second, Record) is None
+            # Registering either owner again must not erase the tombstone.
+            self.send(outgoing, packet(outgoing, flags=2))
+            assert self.get("expect", reply, Expectation).ambiguous == 1
+        finally:
+            self.clean(first)
+            self.clean(second)
+
+    def expectation_exhaustion(self):
+        keys = [key(ack=10000+i) for i in range(32)]
+        for k in keys:
+            self.put("expect", k, Expectation(123, time.monotonic_ns()+120_000_000_000))
+        raw_cookie = int.from_bytes(self.raw[2].getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
+        cookie = self.register(cookie=raw_cookie)
+        outgoing = key(src="127.0.0.2", dst="127.0.0.1", sport=40300, dport=40301, ack=0)
+        try:
+            before = self.counter(0)
+            self.send(outgoing, packet(outgoing, flags=2, seq=0xffffffff))
+            assert self.counter(0) > before
+            assert self.get("conn", cookie, Connection).count == 0
+            for k in keys:
+                self.delete("expect", k)
+            self.send(outgoing, packet(outgoing, flags=2, seq=0xffffffff))
+            reply = key(src="127.0.0.1", dst="127.0.0.2", sport=40301, dport=40300, ack=0)
+            self.send(reply, packet(reply))
+            assert self.get("capture", cookie, Record)
+        finally:
+            for k in keys:
+                self.delete("expect", k)
+            self.clean(cookie)
+
+    def capture_exhaustion(self):
+        held = [self.register() for _ in range(2)]
+        for cookie in held:
+            self.put("capture", cookie, Record(version=1, length=40, timestamp=time.monotonic_ns()))
+        k = key()
+        cookie = self.register(k)
+        try:
+            before = self.counter(3)
+            self.send(k, packet(k))
+            assert self.counter(3) > before
+            assert self.get("conn", cookie, Connection).phase == 0
+            self.delete("capture", held[0])
+            self.send(k, packet(k))
+            assert self.get("capture", cookie, Record)
+        finally:
+            for c in held + [cookie]:
+                self.clean(c)
+
+    def connection_bound(self):
+        held = [self.register() for _ in range(16)]
+        try:
+            try:
+                self.register()
+                raise AssertionError("connection map exceeded capacity")
+            except OSError as e:
+                assert e.errno in (errno.E2BIG, errno.ENOSPC)
+        finally:
+            for c in held:
+                self.clean(c)
+
+
+def main():
+    if len(sys.argv) != 1:
+        Tap.bail("usage: sudo python3 test/ebpf/capture.py")
+    if os.geteuid():
+        Tap.bail("capture.py must run as root")
+    tap = Tap()
+    try:
+        namespace()
+        obj = skeleton_object()
+        try:
+            c = Collector(obj, tap)
+        finally:
+            os.unlink(obj)      # libbpf has read the file by now
+    except Exception as e:
+        Tap.bail(f"cannot load the collector: {e}")
+    try:
+        k4 = key()
+        k6 = key(10, "::1", "::1")
+        c.capture_case("IPv4 headers exclude application payload", k4, packet(k4, payload=b"payload"), 40)
+        c.capture_case("IPv6 headers exclude application payload", k6, packet(k6, payload=b"payload"), 60)
+        c.capture_case("eight IPv6 extension headers", k6, packet(k6, extensions=8), 124)
+        c.capture_case("nine IPv6 extension headers rejected", k6, packet(k6, extensions=9))
+        c.capture_case("IPv4 fragments rejected", k4, packet(k4, fragment=True))
+        c.capture_case("IPv6 fragments rejected", k6, packet(k6, fragment=True))
+        c.capture_case("IPv6 jumbograms rejected", k6, packet(k6, jumbo=True))
+        c.capture_case("ESP rejected", k6, packet(k6, next_header=50))
+        c.capture_case("short TCP header rejected", k4, packet(k4, tcp_offset=4))
+        c.capture_case("inaccessible TCP options rejected", k4, packet(k4, tcp_offset=15))
+        c.capture_case("RST SYN-ACK rejected", k4, packet(k4, flags=0x16))
+        c.capture_case("expired registration/expectation rejected before sweeping", k4, packet(k4), expired=True)
+        options = bytearray(packet(k4))
+        options[0] = 0x46
+        options[2:4] = struct.pack("!H", 44)
+        options[20:20] = bytes([1, 1, 1, 0])
+        c.capture_case("IPv4 options preserved", k4, bytes(options), 44)
+        oversized = bytearray(packet(k6))
+        oversized[4:6] = struct.pack("!H", 216+20)
+        oversized[6] = 60
+        oversized[40:40] = bytes([6, 26]) + bytes(214)
+        c.capture_case("oversized IPv6 header chain rejected", k6, bytes(oversized))
+        for name, case in [
+            ("ACK of SYN data misses, retransmission retention, alias limit, terminal state",
+             c.synack_lifecycle),
+            ("colliding full keys remain ambiguous for both owners", c.collisions),
+            ("expectation exhaustion recovers; ACK arithmetic wraps at 32 bits",
+             c.expectation_exhaustion),
+            ("capture exhaustion releases claim for a later response", c.capture_exhaustion),
+            ("bounded connection map", c.connection_bound),
+        ]:
+            with tap.case(name):
+                case()
+        # Each connection is its own point; this one covers the namespace,
+        # veth pair and NAT rules around them.
+        with tap.case("remote backend namespace set up and torn down"):
+            c.remote()
+    finally:
+        c.close()
+    sys.exit(tap.done())
+
+
+if __name__ == "__main__":
+    main()

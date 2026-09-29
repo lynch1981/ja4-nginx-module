@@ -1,0 +1,540 @@
+// SPDX-License-Identifier: GPL-2.0
+
+/*
+ * Upstream SYN-ACK capture.
+ *
+ * synack_out (POSTROUTING) sees each SYN of a registered socket and records
+ * the SYN-ACK it expects, acknowledging S + 1, under two keys: the
+ * on-the-wire tuple and the socket's original tuple, so capture works across
+ * DNAT/SNAT.  nginx does not use TCP Fast Open upstream, so a SYN-ACK that
+ * acknowledges SYN data is not expected.  synack_in (early
+ * PREROUTING) matches incoming SYN-ACKs against those keys and stores the
+ * original IP/TCP headers for nginx to consume by socket cookie.
+ */
+
+
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
+
+#include "ngx_ebpf.h"
+
+
+#define SYNACK_NF_ACCEPT  1
+
+#define SYNACK_AF_INET              2
+#define SYNACK_AF_INET6             10
+
+#define SYNACK_IPV6_HOPOPTS         0
+#define SYNACK_IPV6_ROUTING         43
+#define SYNACK_IPV6_DSTOPTS         60
+#define SYNACK_IPV6_AH              51
+#define SYNACK_IPV6_MAX_EXTENSIONS  8
+
+#define SYNACK_TCP_SYN              0x02
+#define SYNACK_TCP_RST              0x04
+#define SYNACK_TCP_ACK              0x10
+#define SYNACK_TCP_FLAGS                                                      \
+    (SYNACK_TCP_SYN|SYNACK_TCP_RST|SYNACK_TCP_ACK)
+
+/* the last offset at which a minimal TCP header still fits the record */
+#define SYNACK_MAX_TCP_OFFSET       (SYNACK_MAX_HEADERS - 20)
+
+
+/*
+ * Bounded IP/TCP header reader for Netfilter BPF programs.
+ *
+ * synack_parse_packet() validates the headers from small stack copies and
+ * returns the TCP flags; synack_copy_headers() then copies the complete
+ * headers.  Callers check the flags and map state in between, so packets that
+ * are not of interest never pay for the full copy.
+ */
+
+static __always_inline int
+synack_parse_packet(struct sk_buff *skb, struct synack_key *key,
+    __u32 *header_len, __u32 *sequence)
+{
+    int             i;
+    __u8            ip[40], tcp[20], ext[2], next;
+    __u32           offset, tail, off, total, tcp_len, step;
+    __u64           data_offset, packet_length;
+    unsigned char  *head;
+
+    /*
+     * ctx->skb is a BTF pointer: direct CO-RE loads avoid helper calls on
+     * the per-packet path.  Packet bytes still need bounded probe reads.
+     */
+
+    head = skb->head;
+    offset = skb->network_header;
+    tail = skb->tail;
+    data_offset = skb->data - head;
+    packet_length = skb->len;
+
+    /*
+     * Probe reads do not enforce skb bounds, so check the linear head
+     * explicitly.  Headers outside it are deliberately rejected.
+     */
+
+    if (offset > tail
+        || tail - offset < 20
+        || data_offset > tail
+        || packet_length + data_offset < offset)
+    {
+        return 0;
+    }
+
+    packet_length += data_offset - offset;
+
+    if (bpf_probe_read_kernel(ip, 20, head + offset)) {
+        return 0;
+    }
+
+    if (ip[0] >> 4 == 4) {
+        off = (ip[0] & 0x0f) * 4;
+        total = ((__u32) ip[2] << 8) | ip[3];
+
+        /* options are allowed; fragments and non-TCP are not */
+
+        if (off < 20 || ip[9] != IPPROTO_TCP || (ip[6] & 0x3f) || ip[7]) {
+            return 0;
+        }
+
+        key->family = SYNACK_AF_INET;
+        __builtin_memcpy(key->src, ip + 12, 4);
+        __builtin_memcpy(key->dst, ip + 16, 4);
+
+    } else if (ip[0] >> 4 == 6) {
+
+        if (tail - offset < 40
+            || bpf_probe_read_kernel(ip, 40, head + offset))
+        {
+            return 0;
+        }
+
+        total = ((__u32) ip[4] << 8) | ip[5];
+
+        if (total == 0) {
+            return 0;               /* jumbogram */
+        }
+
+        total += 40;
+
+        key->family = SYNACK_AF_INET6;
+        __builtin_memcpy(key->src, ip + 8, 16);
+        __builtin_memcpy(key->dst, ip + 24, 16);
+
+        next = ip[6];
+        off = 40;
+
+        for (i = 0;
+             i < SYNACK_IPV6_MAX_EXTENSIONS && next != IPPROTO_TCP;
+             i++)
+        {
+            if (off > SYNACK_MAX_TCP_OFFSET
+                || off + 2 > tail - offset
+                || off + 2 > total)
+            {
+                return 0;
+            }
+
+            if (bpf_probe_read_kernel(ext, 2, head + offset + off)) {
+                return 0;
+            }
+
+            if (next == SYNACK_IPV6_HOPOPTS
+                || next == SYNACK_IPV6_ROUTING
+                || next == SYNACK_IPV6_DSTOPTS)
+            {
+                step = ((__u32) ext[1] + 1) * 8;
+
+            } else if (next == SYNACK_IPV6_AH && ext[1] >= 1) {
+                step = ((__u32) ext[1] + 2) * 4;
+
+            } else {
+                return 0;           /* fragment, ESP or unknown */
+            }
+
+            off += step;
+            next = ext[0];
+        }
+
+        if (next != IPPROTO_TCP) {
+            return 0;
+        }
+
+    } else {
+        return 0;
+    }
+
+    if (total > packet_length
+        || off > SYNACK_MAX_TCP_OFFSET
+        || off + 20 > tail - offset
+        || off + 20 > total)
+    {
+        return 0;
+    }
+
+    if (bpf_probe_read_kernel(tcp, 20, head + offset + off)) {
+        return 0;
+    }
+
+    tcp_len = (tcp[12] >> 4) * 4;
+
+    if (tcp_len < 20
+        || off + tcp_len > SYNACK_MAX_HEADERS
+        || off + tcp_len > total
+        || off + tcp_len > tail - offset)
+    {
+        return 0;
+    }
+
+    *header_len = off + tcp_len;
+
+    key->protocol = IPPROTO_TCP;
+    __builtin_memcpy(&key->sport, tcp, 2);
+    __builtin_memcpy(&key->dport, tcp + 2, 2);
+    __builtin_memcpy(&key->ack, tcp + 8, 4);
+    __builtin_memcpy(sequence, tcp + 4, 4);
+
+    return tcp[13];
+}
+
+
+/* header_len must come from a successful synack_parse_packet() on skb */
+
+static __always_inline int
+synack_copy_headers(struct sk_buff *skb, __u8 *bytes, __u32 header_len)
+{
+    __u64           read_len;
+    unsigned char  *head;
+
+    head = skb->head + skb->network_header;
+    read_len = header_len;
+
+    /* keep the verifier's bound on the exact register used by the helper */
+    asm volatile("" : "+r"(read_len));
+
+    if (read_len == 0 || read_len > SYNACK_MAX_HEADERS) {
+        return -1;
+    }
+
+    return bpf_probe_read_kernel(bytes, read_len, head) ? -1 : 0;
+}
+
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, SYNACK_CONNECTIONS);
+    __type(key, __u64);                         /* socket cookie */
+    __type(value, struct synack_connection);
+} synack_conn SEC(".maps");
+
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, SYNACK_EXPECTATIONS);
+    __type(key, struct synack_key);
+    __type(value, struct synack_expectation);
+} synack_expect SEC(".maps");
+
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, SYNACK_CONNECTIONS);
+    __type(key, __u64);                         /* socket cookie */
+    __type(value, struct synack_record);
+} synack_capture SEC(".maps");
+
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __uint(max_entries, SYNACK_STAT_COUNT);
+    __type(key, __u32);
+    __type(value, __u64);
+} synack_stats SEC(".maps");
+
+
+/* temporary storage only; it never retains a connection's result */
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct synack_record);
+} synack_scratch SEC(".maps");
+
+
+static __always_inline void
+synack_count(__u32 id)
+{
+    __u64  *n;
+
+    n = bpf_map_lookup_elem(&synack_stats, &id);
+    if (n) {
+        __sync_fetch_and_add(n, 1);
+    }
+}
+
+
+static __always_inline void
+synack_remove_owned(struct synack_key *key, __u64 cookie)
+{
+    struct synack_expectation  *e;
+
+    e = bpf_map_lookup_elem(&synack_expect, key);
+
+    /* ambiguous keys stay as tombstones until they expire */
+
+    if (e && e->cookie == cookie && !e->ambiguous) {
+        bpf_map_delete_elem(&synack_expect, key);
+    }
+}
+
+
+static __always_inline void
+synack_add_expectation(struct synack_key *key, __u64 cookie,
+    struct synack_connection *c, __u64 now)
+{
+    __u32                       i, slot;
+    struct synack_expectation  *e, value = {
+        .cookie = cookie,
+        .deadline = now + SYNACK_PENDING_NS
+    };
+
+    if (c->phase != SYNACK_PENDING) {
+        return;
+    }
+
+    slot = SYNACK_MAX_ALIASES;
+
+    for (i = 0; i < SYNACK_MAX_ALIASES; i++) {
+        if (i < c->count
+            && __builtin_memcmp(&c->keys[i], key, sizeof(*key)) == 0)
+        {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot == SYNACK_MAX_ALIASES && c->count >= SYNACK_MAX_ALIASES) {
+        synack_count(SYNACK_STAT_ALIAS_FULL);
+        return;
+    }
+
+    e = bpf_map_lookup_elem(&synack_expect, key);
+
+    if (e == NULL
+        && bpf_map_update_elem(&synack_expect, key, &value, BPF_NOEXIST))
+    {
+        /* lost an insert race, or the map is full */
+
+        e = bpf_map_lookup_elem(&synack_expect, key);
+        if (e == NULL) {
+            synack_count(SYNACK_STAT_EXPECT_FULL);
+            return;
+        }
+    }
+
+    if (e) {
+        if (e->cookie != cookie) {
+
+            /*
+             * Never replace another owner.  An expired key stays unavailable
+             * until the userspace sweeper removes it.
+             */
+
+            __sync_lock_test_and_set(&e->ambiguous, 1);
+            e->deadline = value.deadline;
+            synack_count(SYNACK_STAT_COLLISION);
+            return;
+        }
+
+        e->deadline = value.deadline;
+    }
+
+    if (slot == SYNACK_MAX_ALIASES) {
+        slot = c->count;
+
+        if (slot < SYNACK_MAX_ALIASES) {
+            c->keys[slot] = *key;
+            c->count = slot + 1;
+        }
+    }
+
+    /* a concurrent synack_in may have completed while the key was added */
+
+    if (c->phase != SYNACK_PENDING) {
+        synack_remove_owned(key, cookie);
+    }
+}
+
+
+SEC("netfilter")
+int
+synack_out(struct bpf_nf_ctx *ctx)
+{
+    int                          flags;
+    __u32                        length, seq, local, remote;
+    __u64                        cookie, now;
+    struct sock                 *sk;
+    struct synack_key            packet = {}, wire = {}, original = {};
+    struct synack_connection    *c;
+
+    /* every outbound packet reaches this hook: a cookie lookup gates it */
+
+    sk = ctx->state->sk;
+    if (sk == NULL) {
+        sk = ctx->skb->sk;
+    }
+
+    if (sk == NULL) {
+        return SYNACK_NF_ACCEPT;
+    }
+
+    cookie = sk->__sk_common.skc_cookie.counter;
+
+    c = bpf_map_lookup_elem(&synack_conn, &cookie);
+    now = bpf_ktime_get_ns();
+
+    if (c == NULL || c->phase != SYNACK_PENDING || c->deadline <= now) {
+        return SYNACK_NF_ACCEPT;
+    }
+
+    length = 0;
+    seq = 0;
+
+    flags = synack_parse_packet(ctx->skb, &packet, &length, &seq);
+
+    if ((flags & SYNACK_TCP_FLAGS) != SYNACK_TCP_SYN) {
+        return SYNACK_NF_ACCEPT;
+    }
+
+    /* a retransmitted SYN re-adds the same keys, refreshing their deadlines */
+
+    c->deadline = now + SYNACK_PENDING_NS;
+
+    /* the SYN-ACK as it will arrive: the SYN reversed, acknowledging it */
+
+    wire.family = packet.family;
+    wire.protocol = IPPROTO_TCP;
+    __builtin_memcpy(wire.src, packet.dst, 16);
+    __builtin_memcpy(wire.dst, packet.src, 16);
+    wire.sport = packet.dport;
+    wire.dport = packet.sport;
+    wire.ack = bpf_htonl(bpf_ntohl(seq) + 1);
+
+    /* the same SYN-ACK in terms of the socket, before any NAT */
+
+    original = wire;
+
+    if (packet.family == SYNACK_AF_INET) {
+        local = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+        remote = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+        __builtin_memcpy(original.src, &remote, 4);
+        __builtin_memcpy(original.dst, &local, 4);
+
+    } else {
+        BPF_CORE_READ_INTO(&original.src, sk, __sk_common.skc_v6_daddr);
+        BPF_CORE_READ_INTO(&original.dst, sk, __sk_common.skc_v6_rcv_saddr);
+    }
+
+    original.sport = BPF_CORE_READ(sk, __sk_common.skc_dport);
+    original.dport = bpf_htons(BPF_CORE_READ(sk, __sk_common.skc_num));
+
+    synack_add_expectation(&wire, cookie, c, now);
+    synack_add_expectation(&original, cookie, c, now);
+
+    return SYNACK_NF_ACCEPT;
+}
+
+
+SEC("netfilter")
+int
+synack_in(struct bpf_nf_ctx *ctx)
+{
+    int                          i, flags;
+    __u32                        zero, length, seq;
+    __u64                        cookie, now;
+    struct synack_key            key = {};
+    struct synack_record        *tmp;
+    struct synack_connection    *c;
+    struct synack_expectation   *e;
+
+    zero = 0;
+    length = 0;
+    seq = 0;
+
+    /* every inbound packet reaches this hook: stay cheap until a match */
+
+    flags = synack_parse_packet(ctx->skb, &key, &length, &seq);
+
+    if ((flags & SYNACK_TCP_FLAGS) != (SYNACK_TCP_SYN|SYNACK_TCP_ACK)) {
+        return SYNACK_NF_ACCEPT;
+    }
+
+    e = bpf_map_lookup_elem(&synack_expect, &key);
+    now = bpf_ktime_get_ns();
+
+    if (e == NULL || e->ambiguous || e->deadline <= now) {
+        return SYNACK_NF_ACCEPT;
+    }
+
+    tmp = bpf_map_lookup_elem(&synack_scratch, &zero);
+    if (tmp == NULL) {
+        return SYNACK_NF_ACCEPT;
+    }
+
+    __builtin_memset(tmp, 0, sizeof(*tmp));
+
+    if (synack_copy_headers(ctx->skb, tmp->headers, length)) {
+        return SYNACK_NF_ACCEPT;
+    }
+
+    cookie = e->cookie;
+
+    c = bpf_map_lookup_elem(&synack_conn, &cookie);
+    if (c == NULL || c->deadline <= now) {
+        return SYNACK_NF_ACCEPT;
+    }
+
+    /* claim the connection so only one SYN-ACK is ever stored */
+
+    if (__sync_val_compare_and_swap(&c->phase, SYNACK_PENDING, SYNACK_CLAIMED)
+        != SYNACK_PENDING)
+    {
+        return SYNACK_NF_ACCEPT;
+    }
+
+    if (e->ambiguous || e->cookie != cookie) {
+        __sync_lock_test_and_set(&c->phase, SYNACK_PENDING);
+        return SYNACK_NF_ACCEPT;
+    }
+
+    tmp->version = SYNACK_VERSION;
+    tmp->length = length;
+    tmp->timestamp = now;
+
+    if (bpf_map_update_elem(&synack_capture, &cookie, tmp, BPF_NOEXIST)) {
+        __sync_lock_test_and_set(&c->phase, SYNACK_PENDING);
+        synack_count(SYNACK_STAT_CAPTURE_FULL);
+        return SYNACK_NF_ACCEPT;
+    }
+
+    __sync_lock_test_and_set(&c->phase, SYNACK_COMPLETE);
+
+    for (i = 0; i < SYNACK_MAX_ALIASES; i++) {
+        if (i < c->count) {
+            synack_remove_owned(&c->keys[i], cookie);
+        }
+    }
+
+    synack_count(SYNACK_STAT_CAPTURED);
+
+    return SYNACK_NF_ACCEPT;
+}
+
+
+char LICENSE[] SEC("license") = "GPL";
