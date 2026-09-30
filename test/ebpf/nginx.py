@@ -19,7 +19,7 @@ import tempfile
 import threading
 import time
 
-from capture import Connection, Record
+from capture import Connection
 from fixture import Attach, Loader, Stop, Tap, command, namespace, skeleton_object
 
 
@@ -372,7 +372,7 @@ def test_http(binary, tap):
             # e.g. registrations crashed workers left behind: the LRU map
             # evicts them for new ones instead of refusing to register
             wait(lambda: n.maps.empty("conn"))
-            state = Connection(deadline=time.monotonic_ns()+120_000_000_000)
+            state = Connection()
             start = 1 << 61
             count = n.maps.rows["conn"]["max_entries"]
             try:
@@ -444,7 +444,7 @@ def test_eviction(binary, tap):
 
 def test_miss(binary, tap):
     with tap.case("a registered connection whose SYN-ACK was missed is counted at consume"):
-        # the instrumented build registers already expired, so synack_out
+        # the instrumented build registers as not pending, so synack_out
         # records no keys and the SYN-ACK matches nothing
         backend = Backend()
         n = Nginx(binary, True, env={"NGX_SYNACK_TEST_MISS": "1"})

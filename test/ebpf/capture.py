@@ -19,18 +19,21 @@ from fixture import Loader, Tap, Tuple, namespace, remote_backend, rules, skelet
 
 
 class Connection(C.Structure):
-    _fields_ = [("deadline", C.c_uint64), ("phase", C.c_uint32),
+    _fields_ = [("phase", C.c_uint32),
                 ("count", C.c_uint32), ("keys", Tuple * 2)]
 
 
 class Expectation(C.Structure):
-    _fields_ = [("cookie", C.c_uint64), ("deadline", C.c_uint64),
+    _fields_ = [("cookie", C.c_uint64),
                 ("ambiguous", C.c_uint32), ("pad", C.c_uint32)]
+
+
+VERSION = 2     # SYNACK_VERSION
 
 
 class Record(C.Structure):
     _fields_ = [("version", C.c_uint32), ("length", C.c_uint32),
-                ("timestamp", C.c_uint64), ("headers", C.c_ubyte * 256)]
+                ("headers", C.c_ubyte * 256)]
 
 
 def key(family=2, src="127.0.0.2", dst="127.0.0.1", sport=23456,
@@ -129,16 +132,15 @@ class Collector:
     def counter(self, number):
         return self.get("stats", C.c_uint32(number), C.c_uint64).value
 
-    def register(self, k=None, cookie=None, expired=False):
+    def register(self, k=None, cookie=None):
         self.serial += 1
         cookie = C.c_uint64(cookie or self.serial)
-        deadline = time.monotonic_ns() + (-1 if expired else 120_000_000_000)
-        state = Connection(deadline=deadline)
+        state = Connection()
         if k is not None:
             state.keys[0], state.count = k, 1
         self.put("conn", cookie, state)
         if k is not None:
-            self.put("expect", k, Expectation(cookie.value, deadline))
+            self.put("expect", k, Expectation(cookie.value))
         return cookie
 
     def clean(self, cookie):
@@ -156,9 +158,9 @@ class Collector:
         # slow software-emulated guests can defer loopback RX to ksoftirqd.
         time.sleep(0.03)
 
-    def capture_case(self, name, k, data, length=None, expired=False):
+    def capture_case(self, name, k, data, length=None):
         with self.tap.case(name):
-            cookie = self.register(k, expired=expired)
+            cookie = self.register(k)
             try:
                 self.send(k, data)
                 record = self.get("capture", cookie, Record, consume=True)
@@ -166,7 +168,7 @@ class Collector:
                     assert record is None, name
                     assert self.get("conn", cookie, Connection).phase == 0, name
                 else:
-                    assert record and record.version == 1 and record.length == length, (
+                    assert record and record.version == VERSION and record.length == length, (
                         name, "record", record, "state", self.get("conn", cookie, Connection),
                         "expectation", self.get("expect", k, Expectation))
                     assert bytes(record.headers[length:]) == bytes(256-length), name
@@ -197,12 +199,12 @@ class Collector:
             data_ack = key(src="127.0.0.1", dst="127.0.0.2", sport=40101, dport=40100, ack=106)
             self.send(data_ack, packet(data_ack))
             assert self.get("capture", cookie, Record) is None
-            # A retransmitted SYN keeps the same keys and refreshes their deadlines.
+            # A retransmitted SYN keeps the same keys.
             self.send(outgoing, packet(outgoing, flags=2))
             newer = self.get("conn", cookie, Connection)
             assert newer.count == 2 and bytes(newer.keys) == bytes(state.keys)
             for k in newer.keys:
-                assert self.get("expect", k, Expectation).deadline == newer.deadline
+                assert self.get("expect", k, Expectation).cookie == cookie.value
             # A SYN with another sequence number cannot add more aliases.
             previous = self.counter(1)
             self.send(outgoing, packet(outgoing, flags=2, seq=999))
@@ -233,8 +235,7 @@ class Collector:
             cookie = self.register(cookie=value)
             try:
                 if hold:
-                    self.put("capture", cookie, Record(version=1, length=40,
-                                                      timestamp=time.monotonic_ns()))
+                    self.put("capture", cookie, Record(version=VERSION, length=40))
                 client.connect((address, 23456))
                 yield cookie
             finally:
@@ -252,7 +253,7 @@ class Collector:
             # A stored capture deletes the registration and every key it owned.
             with self.tcp(address) as cookie:
                 record = self.get("capture", cookie, Record, consume=True)
-                assert record and record.version == 1, name
+                assert record and record.version == VERSION, name
                 data = bytes(record.headers[:record.length])
                 # The packet family decides the header layout, not the socket.
                 ipv4 = data[0] >> 4 == 4
@@ -315,10 +316,9 @@ class Collector:
 
     def expectation_eviction(self):
         # A full expectation map evicts instead of refusing the SYN's keys.
-        future = time.monotonic_ns() + 120_000_000_000
         keys = [key(ack=10000+i) for i in range(2 * CAPACITY["expect"])]
         for k in keys:
-            self.put("expect", k, Expectation(123, future))
+            self.put("expect", k, Expectation(123))
         raw_cookie = int.from_bytes(self.raw[2].getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
         cookie = self.register(cookie=raw_cookie)
         outgoing = key(src="127.0.0.2", dst="127.0.0.1", sport=40300, dport=40301, ack=0)
@@ -340,7 +340,7 @@ class Collector:
         # A full capture map makes room by evicting the oldest records.
         held = [self.register() for _ in range(2 * CAPACITY["capture"])]
         for cookie in held:
-            self.put("capture", cookie, Record(version=1, length=40, timestamp=time.monotonic_ns()))
+            self.put("capture", cookie, Record(version=VERSION, length=40))
         k = key()
         cookie = self.register(k)
         try:
@@ -363,12 +363,14 @@ class Collector:
             for c in held:
                 self.clean(c)
 
-    def expired_takeover(self):
-        # A key someone left behind expires into a free key: the next owner
-        # takes it over instead of both being blocked as a collision.
+    def stale_owner_takeover(self):
+        # A key left behind by a registration that no longer exists (here an
+        # ambiguous one, owned by cookie 123) is free: the next owner takes it
+        # over instead of both being blocked as a collision. A key whose owner
+        # is still registered stays a collision (see collisions()).
         outgoing = key(src="127.0.0.2", dst="127.0.0.1", sport=40500, dport=40501, ack=0)
         reply = key(src="127.0.0.1", dst="127.0.0.2", sport=40501, dport=40500, ack=101)
-        self.put("expect", reply, Expectation(123, time.monotonic_ns() - 1, 1))
+        self.put("expect", reply, Expectation(123, 1))
         raw_cookie = int.from_bytes(self.raw[2].getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
         cookie = self.register(cookie=raw_cookie)
         try:
@@ -413,7 +415,6 @@ def main():
         c.capture_case("short TCP header rejected", k4, packet(k4, tcp_offset=4))
         c.capture_case("inaccessible TCP options rejected", k4, packet(k4, tcp_offset=15))
         c.capture_case("RST SYN-ACK rejected", k4, packet(k4, flags=0x16))
-        c.capture_case("expired registration/expectation rejected", k4, packet(k4), expired=True)
         options = bytearray(packet(k4))
         options[0] = 0x46
         options[2:4] = struct.pack("!H", 44)
@@ -432,8 +433,8 @@ def main():
              c.expectation_eviction),
             ("full capture map evicts for a new capture", c.capture_eviction),
             ("full connection map evicts for a new registration", c.connection_eviction),
-            ("an expired key left behind is taken over, not a collision",
-             c.expired_takeover),
+            ("a key whose owner is gone is taken over, not a collision",
+             c.stale_owner_takeover),
         ]:
             with tap.case(name):
                 case()

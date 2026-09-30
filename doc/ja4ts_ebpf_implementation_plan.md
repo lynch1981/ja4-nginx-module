@@ -63,13 +63,14 @@ The full 44-byte key contains native-endian family, protocol 6, zero padding,
 16-byte source/destination addresses (IPv4 in the first four bytes, rest zero),
 and network-order ports and ACK. See `ebpf/ngx_ebpf.h`.
 
-A retransmitted SYN re-adds the same keys, refreshing their deadlines. Extra
-distinct aliases beyond two, e.g. from a SYN with another sequence number, are
-counted and skipped. Another cookie never replaces a key's owner: a collision marks it
-ambiguous, neither owner matches it, and it remains a tombstone until expiry.
+A retransmitted SYN re-adds the same keys. Extra distinct aliases beyond two,
+e.g. from a SYN with another sequence number, are counted and skipped. Another
+cookie never replaces a live owner, one whose registration still exists: that
+collision marks the key ambiguous, neither owner matches it, and it remains a
+tombstone until the LRU map evicts it. A key whose owner is gone is taken over.
 
 PREROUTING processes SYN-ACK packets with RST clear. It matches the complete key,
-checks deadlines, registration and ownership, atomically claims the connection,
+checks registration and ownership, atomically claims the connection,
 and publishes headers. Failure to publish releases the claim. Success marks the
 connection complete and removes its nonambiguous aliases. The terminal state
 prevents recreation after a userspace consume, including retransmitted SYNs.
@@ -132,15 +133,15 @@ userspace failures have diagnostic counters in a shared
 mmapable statistics array; updates use atomic additions. Counter IDs are private
 and defined in the ABI header. There is no production debug variable or CLI.
 
-Pending metadata expires 120 seconds after the latest supported SYN. Unconsumed
-headers expire after 10 seconds, normally disappearing at immediate handoff.
-Lookup enforces deadlines independently of reclamation. Capture, consumption and
-close remove entries on the fast path. Nothing sweeps: what a failure leaves
+Nothing carries a time, and the programs never read the clock: an entry lives
+as long as its socket's registration. Capture, consumption and close remove
+entries on the fast path, and headers are consumed right after the handshake.
+Nothing sweeps: what a failure leaves
 behind (a crashed worker, a missed SYN-ACK, an ambiguous key) is never looked up
 again, so the LRU maps evict it first when an insert needs room, with bounded
-work per insert and no periodic pass in the kernel or a worker. An expired
-expectation is taken over by the next owner of its key rather than treated as a
-collision. The cost is that an insert never fails for room: past capacity, the
+work per insert and no periodic pass in the kernel or a worker. An expectation
+whose owner is gone is taken over by the next owner of its key rather than
+treated as a collision. The cost is that an insert never fails for room: past capacity, the
 oldest live entry is evicted. The consumer counts that as `EVICTED` when both
 its registration and its capture are gone. It counts `MISSED` when the
 registration is still pending, i.e. the SYN-ACK was not captured. The insert and
@@ -175,9 +176,9 @@ production object.
 
 The acceptance runners are in `test/ebpf/`:
 
-- `capture.py`: production collector, 29 cases (TAP, run with `prove`): malformed packets,
+- `capture.py`: production collector, 28 cases (TAP, run with `prove`): malformed packets,
   options/extensions, SYN-data ACK misses, retransmissions, terminal state,
-  ambiguous ownership, ACK wraparound, eviction from full maps, expired-key
+  ambiguous ownership, ACK wraparound, eviction from full maps, stale-owner
   takeover, and
   separate-namespace IPv4/IPv6/mapped/NAT/untracked peers. It is also the
   cross-kernel CO-RE check.

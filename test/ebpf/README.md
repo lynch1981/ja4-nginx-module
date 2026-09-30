@@ -60,13 +60,13 @@ Each case belongs to the lowest layer that can observe it.
 - **`capture.py`: the collector, driven directly.** It extracts the object
   embedded in the committed skeleton, exactly what nginx ships, loads it with
   test map capacities (1024 registrations and captures, 2048 expectations)
-  and reports 30 TAP points: 29 cases plus the remote namespace setup:
+  and reports 29 TAP points: 28 cases plus the remote namespace setup:
   - crafted packets: payload exclusion, IPv4 options, IPv6 extension limits,
     fragments, jumbograms, ESP, bad TCP offsets, and RST
-  - deadlines, SYN-data ACK misses, retransmission alias retention,
-    terminal state, colliding ownership, and ACK wraparound
+  - SYN-data ACK misses, retransmission alias retention, terminal state,
+    colliding ownership, and ACK wraparound
   - eviction from all three LRU maps when overfilled to twice their capacity,
-    and an expired key left behind taken over by its next owner
+    and a key whose owner is gone taken over by its next owner
   - real TCP to a backend in a separate namespace: IPv4, IPv6, an IPv4-mapped
     socket, untracked traffic, and DNAT/SNAT
   Nginx cannot produce these packets or map states. Run the **same object** on

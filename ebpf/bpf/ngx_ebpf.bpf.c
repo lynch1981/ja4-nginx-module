@@ -228,7 +228,7 @@ synack_copy_headers(struct sk_buff *skb, __u8 *bytes, __u32 header_len)
  * Capture, consume and close remove entries on the fast path.  What a failure
  * leaves behind (a crashed worker, a missed SYN-ACK, an ambiguous key) is
  * never looked up again, so the LRU maps evict it first when an insert needs
- * room; no sweep runs.  Lookups ignore expired entries meanwhile.
+ * room; no sweep runs, and nothing needs the clock.
  */
 
 struct {
@@ -293,7 +293,7 @@ synack_remove_owned(struct synack_key *key, __u64 cookie)
 
     e = bpf_map_lookup_elem(&synack_expect, key);
 
-    /* ambiguous keys stay as tombstones until they expire */
+    /* ambiguous keys stay as tombstones until the LRU map evicts them */
 
     if (e && e->cookie == cookie && !e->ambiguous) {
         bpf_map_delete_elem(&synack_expect, key);
@@ -301,14 +301,25 @@ synack_remove_owned(struct synack_key *key, __u64 cookie)
 }
 
 
+/*
+ * A key's owner is alive while its registration exists: nginx removes it at
+ * consume or close, and synack_in once it stores the capture.
+ */
+
+static __always_inline int
+synack_owner_alive(__u64 cookie)
+{
+    return bpf_map_lookup_elem(&synack_conn, &cookie) != NULL;
+}
+
+
 static __always_inline void
 synack_add_expectation(struct synack_key *key, __u64 cookie,
-    struct synack_connection *c, __u64 now)
+    struct synack_connection *c)
 {
     __u32                       i, slot;
     struct synack_expectation  *e, value = {
-        .cookie = cookie,
-        .deadline = now + SYNACK_PENDING_NS
+        .cookie = cookie
     };
 
     if (c->phase != SYNACK_PENDING) {
@@ -345,31 +356,25 @@ synack_add_expectation(struct synack_key *key, __u64 cookie,
         }
     }
 
-    if (e) {
-        if (e->deadline <= now) {
+    if (e && e->cookie != cookie) {
 
-            /*
-             * An expired key, e.g. one a crashed worker left behind, is
-             * taken over as if absent.  The deadline goes last: until then
-             * synack_in still sees an expired key and ignores it.
-             */
-
-            e->cookie = cookie;
-            __sync_lock_test_and_set(&e->ambiguous, 0);
-            e->deadline = value.deadline;
-
-        } else if (e->cookie != cookie) {
+        if (synack_owner_alive(e->cookie)) {
 
             /* never replace another live owner */
 
             __sync_lock_test_and_set(&e->ambiguous, 1);
-            e->deadline = value.deadline;
             synack_count(SYNACK_STAT_COLLISION);
             return;
-
-        } else {
-            e->deadline = value.deadline;
         }
+
+        /*
+         * The owner is gone, e.g. its worker crashed: take the key over as
+         * if absent.  A concurrent synack_in that still reads the old cookie
+         * finds no registration for it and ignores the key.
+         */
+
+        e->cookie = cookie;
+        __sync_lock_test_and_set(&e->ambiguous, 0);
     }
 
     if (slot == SYNACK_MAX_ALIASES) {
@@ -395,7 +400,7 @@ synack_out(struct bpf_nf_ctx *ctx)
 {
     int                          flags;
     __u32                        length, seq, local, remote;
-    __u64                        cookie, now;
+    __u64                        cookie;
     struct sock                 *sk;
     struct synack_key            packet = {}, wire = {}, original = {};
     struct synack_connection    *c;
@@ -419,17 +424,6 @@ synack_out(struct bpf_nf_ctx *ctx)
         return SYNACK_NF_ACCEPT;
     }
 
-    /*
-     * Only registered sockets reach the clock: it can be slow to read, and
-     * Netfilter programs cannot call bpf_ktime_get_coarse_ns().
-     */
-
-    now = bpf_ktime_get_ns();
-
-    if (c->deadline <= now) {
-        return SYNACK_NF_ACCEPT;
-    }
-
     length = 0;
     seq = 0;
 
@@ -439,9 +433,7 @@ synack_out(struct bpf_nf_ctx *ctx)
         return SYNACK_NF_ACCEPT;
     }
 
-    /* a retransmitted SYN re-adds the same keys, refreshing their deadlines */
-
-    c->deadline = now + SYNACK_PENDING_NS;
+    /* a retransmitted SYN re-adds the same keys */
 
     /* the SYN-ACK as it will arrive: the SYN reversed, acknowledging it */
 
@@ -471,8 +463,8 @@ synack_out(struct bpf_nf_ctx *ctx)
     original.sport = BPF_CORE_READ(sk, __sk_common.skc_dport);
     original.dport = bpf_htons(BPF_CORE_READ(sk, __sk_common.skc_num));
 
-    synack_add_expectation(&wire, cookie, c, now);
-    synack_add_expectation(&original, cookie, c, now);
+    synack_add_expectation(&wire, cookie, c);
+    synack_add_expectation(&original, cookie, c);
 
     return SYNACK_NF_ACCEPT;
 }
@@ -484,7 +476,7 @@ synack_in(struct bpf_nf_ctx *ctx)
 {
     int                          i, flags;
     __u32                        zero, length, seq;
-    __u64                        cookie, now;
+    __u64                        cookie;
     struct synack_key            key = {};
     struct synack_record        *tmp;
     struct synack_connection    *c;
@@ -503,9 +495,8 @@ synack_in(struct bpf_nf_ctx *ctx)
     }
 
     e = bpf_map_lookup_elem(&synack_expect, &key);
-    now = bpf_ktime_get_ns();
 
-    if (e == NULL || e->ambiguous || e->deadline <= now) {
+    if (e == NULL || e->ambiguous) {
         return SYNACK_NF_ACCEPT;
     }
 
@@ -522,8 +513,10 @@ synack_in(struct bpf_nf_ctx *ctx)
 
     cookie = e->cookie;
 
+    /* a key whose owner is gone matches nothing */
+
     c = bpf_map_lookup_elem(&synack_conn, &cookie);
-    if (c == NULL || c->deadline <= now) {
+    if (c == NULL) {
         return SYNACK_NF_ACCEPT;
     }
 
@@ -542,7 +535,6 @@ synack_in(struct bpf_nf_ctx *ctx)
 
     tmp->version = SYNACK_VERSION;
     tmp->length = length;
-    tmp->timestamp = now;
 
     if (bpf_map_update_elem(&synack_capture, &cookie, tmp, BPF_NOEXIST)) {
         __sync_lock_test_and_set(&c->phase, SYNACK_PENDING);

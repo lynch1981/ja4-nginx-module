@@ -13,7 +13,6 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 
-#include <time.h>
 #include <bpf/bpf.h>
 
 #include "ngx_ebpf_module.h"
@@ -21,21 +20,7 @@
 #include "ngx_ebpf.h"
 
 
-static uint64_t ngx_ebpf_now(void);
 static ngx_uint_t ngx_ebpf_remove(uint64_t cookie, ngx_uint_t consumed);
-
-
-static uint64_t
-ngx_ebpf_now(void)
-{
-    struct timespec  ts;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1) {
-        return 0;
-    }
-
-    return (uint64_t) ts.tv_sec * SYNACK_NSEC_PER_SEC + ts.tv_nsec;
-}
 
 
 void
@@ -72,12 +57,11 @@ ngx_connection_register_synack(ngx_connection_t *c, struct sockaddr *sa,
     }
 
     ngx_memzero(&state, sizeof(struct synack_connection));
-    state.deadline = ngx_ebpf_now() + SYNACK_PENDING_NS;
 
 #if (NGX_SYNACK_TEST)
     if (getenv("NGX_SYNACK_TEST_MISS")) {
-        /* already expired: synack_out ignores it, so its SYN-ACK is missed */
-        state.deadline = ngx_ebpf_now() - 1;
+        /* not pending: synack_out ignores it, so its SYN-ACK is missed */
+        state.phase = SYNACK_CLAIMED;
     }
 #endif
 
@@ -107,7 +91,7 @@ ngx_connection_save_synack(ngx_connection_t *c)
 {
     int                    rc;
     u_char                *buf;
-    uint64_t               now, cookie;
+    uint64_t               cookie;
     socklen_t              len;
     ngx_uint_t             registered;
     struct tcp_info        info;
@@ -186,13 +170,14 @@ ngx_connection_save_synack(ngx_connection_t *c)
         return;
     }
 
-    now = ngx_ebpf_now();
+    /*
+     * No freshness check: only this socket's SYN-ACK can create its record,
+     * and it is consumed right after the handshake.
+     */
 
     if (record.version != SYNACK_VERSION
         || record.length < 40
-        || record.length > SYNACK_MAX_HEADERS
-        || record.timestamp > now
-        || now - record.timestamp >= SYNACK_CAPTURE_NS)
+        || record.length > SYNACK_MAX_HEADERS)
     {
         ngx_ebpf_count(SYNACK_STAT_INVALID_RECORD);
         return;

@@ -15,15 +15,11 @@
 #endif
 
 
-#define SYNACK_VERSION          1
+#define SYNACK_VERSION          2
 #define SYNACK_MAX_HEADERS      256
 #define SYNACK_MAX_ALIASES      2       /* wire and socket tuples */
 #define SYNACK_CONNECTIONS      65536
 #define SYNACK_EXPECTATIONS     (SYNACK_MAX_ALIASES * SYNACK_CONNECTIONS)
-
-#define SYNACK_NSEC_PER_SEC     1000000000ULL
-#define SYNACK_PENDING_NS       (120 * SYNACK_NSEC_PER_SEC)
-#define SYNACK_CAPTURE_NS       (10 * SYNACK_NSEC_PER_SEC)
 
 
 /*
@@ -51,8 +47,13 @@ enum synack_phase {
 };
 
 
+/*
+ * Nothing here carries a time: an entry lives as long as its socket's
+ * registration, which nginx removes at consume or close, and what failures
+ * leave behind is evicted by the LRU maps.
+ */
+
 struct synack_connection {
-    __u64                   deadline;
     __u32                   phase;
     __u32                   count;
     struct synack_key       keys[SYNACK_MAX_ALIASES];
@@ -61,7 +62,6 @@ struct synack_connection {
 
 struct synack_expectation {
     __u64                   cookie;
-    __u64                   deadline;
     __u32                   ambiguous;
     __u32                   pad;
 };
@@ -70,7 +70,6 @@ struct synack_expectation {
 struct synack_record {
     __u32                   version;
     __u32                   length;
-    __u64                   timestamp;
     __u8                    headers[SYNACK_MAX_HEADERS];
 };
 
