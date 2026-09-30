@@ -59,17 +59,27 @@ pick() {
 clang=${BPF_CLANG:-$(pick clang-18 clang)}
 bpftool=${BPFTOOL:-bpftool}
 
-tmp=$(mktemp -d)
+# A fixed-length work path, not $TMPDIR: its length, though not its name,
+# changes clang's type order and so the output.
+tmp=$(mktemp -d /tmp/ngx_ebpf.XXXXXXXXXX)
 trap 'rm -rf "$tmp"' EXIT
 
 "$bpftool" btf dump file "${BPF_BTF:-/sys/kernel/btf/vmlinux}" format c \
     > "$tmp/vmlinux.h"
 
-# The prefix maps keep local paths out of the embedded BTF line info.
-"$clang" $flags \
-    -ffile-prefix-map="$tmp"=. -ffile-prefix-map="$src"=. \
-    -I"$tmp" -I"$src" \
-    -c "$src/bpf/ngx_ebpf.bpf.c" -o "$tmp/ngx_ebpf.tmp.o"
+# Compile a copy of the inputs by relative paths only, so the output does not
+# depend on where the checkout lives or where the script runs from: absolute
+# paths change clang's type order, and the source-line text embedded in the
+# BTF line info is read back through the recorded (relative) file name.
+mkdir "$tmp/bpf"
+cp "$src/bpf/ngx_ebpf.bpf.c" "$tmp/bpf/"
+cp "$src/ngx_ebpf.h" "$tmp/"
+
+(
+    cd "$tmp"
+    "$clang" $flags -fdebug-compilation-dir=. -I. \
+        -c bpf/ngx_ebpf.bpf.c -o ngx_ebpf.tmp.o
+)
 
 # The BPF static linker drops DWARF (~0.9 MB) and keeps the .BTF and .BTF.ext
 # sections that CO-RE needs.
