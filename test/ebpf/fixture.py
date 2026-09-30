@@ -193,6 +193,7 @@ class Loader:
             "bpf_map_lookup_elem": (C.c_int, [C.c_int, C.c_void_p, C.c_void_p]),
             "bpf_map_lookup_and_delete_elem": (C.c_int, [C.c_int, C.c_void_p, C.c_void_p]),
             "bpf_map_delete_elem": (C.c_int, [C.c_int, C.c_void_p]),
+            "bpf_map_get_next_key": (C.c_int, [C.c_int, C.c_void_p, C.c_void_p]),
         }
         for name, (result, args) in signatures.items():
             fn = getattr(self.lib, name)

@@ -397,9 +397,19 @@ synack_out(struct bpf_nf_ctx *ctx)
     cookie = sk->__sk_common.skc_cookie.counter;
 
     c = bpf_map_lookup_elem(&synack_conn, &cookie);
+
+    if (c == NULL || c->phase != SYNACK_PENDING) {
+        return SYNACK_NF_ACCEPT;
+    }
+
+    /*
+     * Only registered sockets reach the clock: it can be slow to read, and
+     * Netfilter programs cannot call bpf_ktime_get_coarse_ns().
+     */
+
     now = bpf_ktime_get_ns();
 
-    if (c == NULL || c->phase != SYNACK_PENDING || c->deadline <= now) {
+    if (c->deadline <= now) {
         return SYNACK_NF_ACCEPT;
     }
 
@@ -530,6 +540,10 @@ synack_in(struct bpf_nf_ctx *ctx)
             synack_remove_owned(&c->keys[i], cookie);
         }
     }
+
+    /* the capture now carries the result; c must not be used after this */
+
+    bpf_map_delete_elem(&synack_conn, &cookie);
 
     synack_count(SYNACK_STAT_CAPTURED);
 

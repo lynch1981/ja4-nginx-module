@@ -448,7 +448,7 @@ ngx_connection_save_synack(ngx_connection_t *c)
 {
     int                    rc;
     u_char                *buf;
-    uint64_t               now;
+    uint64_t               now, cookie;
     socklen_t              len;
     struct tcp_info        info;
     struct synack_record   record;
@@ -478,8 +478,18 @@ ngx_connection_save_synack(ngx_connection_t *c)
 
     c->synack_processed = 1;
 
-    rc = bpf_map_lookup_and_delete_elem(ngx_ebpf_capture_fd,
-                                        &c->synack_cookie, &record);
+    cookie = c->synack_cookie;
+
+    rc = bpf_map_lookup_and_delete_elem(ngx_ebpf_capture_fd, &cookie,
+                                        &record);
+
+    /*
+     * The registration has no further use either way: a successful capture
+     * has already deleted it in BPF, and a missed one can no longer happen.
+     */
+
+    ngx_connection_cleanup_synack(c);
+
     if (rc < 0) {
         if (rc != -ENOENT) {
             ngx_ebpf_count(SYNACK_STAT_HANDOFF_ERROR);
@@ -525,21 +535,17 @@ ngx_connection_save_synack(ngx_connection_t *c)
     struct synack_record       retained;
     struct synack_connection   state;
 
-    present = bpf_map_lookup_elem(ngx_ebpf_capture_fd, &c->synack_cookie,
-                                  &retained) == 0;
-
-    ngx_memzero(&state, sizeof(struct synack_connection));
-    (void) bpf_map_lookup_elem(ngx_ebpf_conn_fd, &c->synack_cookie, &state);
+    present = bpf_map_lookup_elem(ngx_ebpf_capture_fd, &cookie, &retained)
+              == 0
+              || bpf_map_lookup_elem(ngx_ebpf_conn_fd, &cookie, &state) == 0;
 
     raw.data = hex;
     raw.len = ngx_hex_dump(hex, c->saved_synack.data, c->saved_synack.len)
               - hex;
 
     ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
-                  "synack test handoff: cookie=%uL len=%uz kernel=%d "
-                  "aliases=%ui raw=%V",
-                  c->synack_cookie, c->saved_synack.len, present,
-                  (ngx_uint_t) state.count, &raw);
+                  "synack test handoff: cookie=%uL len=%uz kernel=%d raw=%V",
+                  cookie, c->saved_synack.len, present, &raw);
     }
 #endif
 }

@@ -6,6 +6,7 @@ exactly what nginx ships. Requires root. Everything runs in an anonymous,
 private network namespace. Map resizing is test-only; production defaults are
 defined in ngx_ebpf.h.
 """
+from contextlib import contextmanager
 import ctypes as C
 import errno
 import os
@@ -100,6 +101,16 @@ class Collector:
         rc = self.lib.bpf_map_delete_elem(self.fds[name], C.byref(k))
         assert not rc or C.get_errno() == errno.ENOENT
 
+    def owned(self, cookie):
+        """Every expectation key in the map that still points at cookie."""
+        keys, k, prev = [], Tuple(), None
+        while self.lib.bpf_map_get_next_key(self.fds["expect"], prev, C.byref(k)) == 0:
+            e = self.get("expect", k, Expectation)
+            if e and e.cookie == cookie.value:
+                keys.append(Tuple.from_buffer_copy(k))
+            prev = C.byref(Tuple.from_buffer_copy(k))
+        return keys
+
     def counter(self, number):
         return self.get("stats", C.c_uint32(number), C.c_uint64).value
 
@@ -141,14 +152,14 @@ class Collector:
                     assert self.get("conn", cookie, Connection).phase == 0, name
                 else:
                     assert record and record.version == 1 and record.length == length, (
-                        name, "record", record, "phase", self.get("conn", cookie, Connection).phase,
+                        name, "record", record, "state", self.get("conn", cookie, Connection),
                         "expectation", self.get("expect", k, Expectation))
                     assert bytes(record.headers[length:]) == bytes(256-length), name
                     # IPv4 raw sends cause the kernel to fill the IP checksum.
                     off = 20 if k.family == 2 else 0
                     assert bytes(record.headers[off:length]) == data[off:length], name
                     assert self.get("expect", k, Expectation) is None, name
-                    assert self.get("conn", cookie, Connection).phase == 2, name
+                    assert self.get("conn", cookie, Connection) is None, name
                     self.send(k, data)
                     assert self.get("capture", cookie, Record) is None, name + " recreated after consumption"
             finally:
@@ -184,6 +195,8 @@ class Collector:
             assert self.counter(1) > previous
             self.send(reply, packet(reply))
             assert self.get("capture", cookie, Record, consume=True)
+            assert self.get("conn", cookie, Connection) is None
+            assert not self.owned(cookie)
             # Terminal state: nothing is captured again after the handoff.
             self.send(outgoing, packet(outgoing, flags=2))
             self.send(reply, packet(reply))
@@ -191,32 +204,48 @@ class Collector:
         finally:
             self.clean(cookie)
 
+    @contextmanager
+    def tcp(self, address, hold=False):
+        """A registered TCP connection to the remote backend; hold=True fills
+        this cookie's capture slot first, so its SYN-ACK is seen but not stored."""
+        family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as client:
+            if family == socket.AF_INET6:
+                # IPv4-mapped destinations send IPv4 packets from this socket.
+                client.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            client.settimeout(3)
+            value = int.from_bytes(client.getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
+            cookie = self.register(cookie=value)
+            try:
+                if hold:
+                    self.put("capture", cookie, Record(version=1, length=40,
+                                                      timestamp=time.monotonic_ns()))
+                client.connect((address, 23456))
+                yield cookie
+            finally:
+                self.clean(cookie)
+
     def tcp_case(self, name, address, expected_source, aliases):
         with self.tap.case("production " + name):
-            family = socket.AF_INET6 if ":" in address else socket.AF_INET
-            with socket.socket(family, socket.SOCK_STREAM) as client:
-                if family == socket.AF_INET6:
-                    # IPv4-mapped destinations send IPv4 packets from this socket.
-                    client.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-                client.settimeout(3)
-                value = int.from_bytes(client.getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
-                cookie = self.register(cookie=value)
-                try:
-                    client.connect((address, 23456))
-                    record = self.get("capture", cookie, Record, consume=True)
-                    assert record and record.version == 1, name
-                    data = bytes(record.headers[:record.length])
-                    # The packet family decides the header layout, not the socket.
-                    ipv4 = data[0] >> 4 == 4
-                    source = data[12:16] if ipv4 else data[8:24]
-                    expected = socket.AF_INET if ipv4 else socket.AF_INET6
-                    assert source == socket.inet_pton(expected, expected_source), name
-                    state = self.get("conn", cookie, Connection)
-                    assert state.phase == 2 and state.count == aliases, (name, state.count)
-                    for k in state.keys[:state.count]:
-                        assert self.get("expect", k, Expectation) is None, name
-                finally:
-                    self.clean(cookie)
+            # A missed capture leaves the registration with the keys the SYN
+            # added: the wire tuple, plus the socket tuple when NAT changed it.
+            with self.tcp(address, hold=True) as cookie:
+                state = self.get("conn", cookie, Connection)
+                assert state.phase == 0 and state.count == aliases, (name, state.count)
+                assert sorted(bytes(k) for k in self.owned(cookie)) == sorted(
+                    bytes(k) for k in state.keys[:state.count]), name
+            # A stored capture deletes the registration and every key it owned.
+            with self.tcp(address) as cookie:
+                record = self.get("capture", cookie, Record, consume=True)
+                assert record and record.version == 1, name
+                data = bytes(record.headers[:record.length])
+                # The packet family decides the header layout, not the socket.
+                ipv4 = data[0] >> 4 == 4
+                source = data[12:16] if ipv4 else data[8:24]
+                expected = socket.AF_INET if ipv4 else socket.AF_INET6
+                assert source == socket.inet_pton(expected, expected_source), name
+                assert self.get("conn", cookie, Connection) is None, name
+                assert not self.owned(cookie), name
 
     def remote(self):
         with remote_backend():
@@ -231,13 +260,13 @@ class Collector:
                 ("remote DNAT", "198.51.100.9", "192.0.2.2",
                  "ip daddr 198.51.100.9 tcp dport 23456 dnat ip to 192.0.2.2:23456", ""),
                 ("remote SNAT", "192.0.2.2", "192.0.2.2", "",
-                 "ip daddr 192.0.2.2 tcp dport 23456 snat ip to 192.0.2.1:34569"),
+                 "ip daddr 192.0.2.2 tcp dport 23456 snat ip to 192.0.2.1:34560-34569"),
                 ("remote DNAT+SNAT", "198.51.100.10", "192.0.2.2",
                  "ip daddr 198.51.100.10 tcp dport 23456 dnat ip to 192.0.2.2:23456",
-                 "ip daddr 192.0.2.2 tcp dport 23456 snat ip to 192.0.2.1:34570"),
+                 "ip daddr 192.0.2.2 tcp dport 23456 snat ip to 192.0.2.1:34570-34579"),
                 ("remote IPv6 DNAT+SNAT", "2001:db8:2::9", "2001:db8:1::2",
                  "ip6 daddr 2001:db8:2::9 tcp dport 23456 dnat ip6 to [2001:db8:1::2]:23456",
-                 "ip6 daddr 2001:db8:1::2 tcp dport 23456 snat ip6 to [2001:db8:1::1]:34571"),
+                 "ip6 daddr 2001:db8:1::2 tcp dport 23456 snat ip6 to [2001:db8:1::1]:34580-34589"),
             ]:
                 body = ""
                 if out:

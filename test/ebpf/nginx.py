@@ -229,7 +229,7 @@ http {{
         return self.finish(self.begin(path, port))
 
     def handoffs(self):
-        return re.findall(r"synack test handoff: cookie=(\d+) len=(\d+) kernel=(\d+) aliases=(\d+) raw=([0-9a-f]+)", self.log.read_text())
+        return re.findall(r"synack test handoff: cookie=(\d+) len=(\d+) kernel=(\d+) raw=([0-9a-f]+)", self.log.read_text())
 
     def reload(self, enabled):
         old = self.worker()
@@ -338,10 +338,11 @@ def test_http(binary, tap):
             client = n.begin()
             assert backend.ready.get(timeout=5) == "request"
             handoff = wait(lambda: n.handoffs())[-1]
-            cookie, length, present, _, raw = handoff
+            cookie, length, present, raw = handoff
             assert present == "0" and len(bytes.fromhex(raw)) == int(length)
+            # The registration is released at handoff, while the upstream is still open.
             assert n.maps.empty("capture") and n.maps.empty("expect")
-            assert n.maps.get("conn", int(cookie), Connection).phase == 2
+            assert n.maps.get("conn", int(cookie), Connection) is None
             backend.release.set()
             response = n.finish(client)
             client = None
