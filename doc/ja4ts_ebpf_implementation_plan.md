@@ -72,7 +72,11 @@ cookie never replaces a live owner, one whose registration still exists: that
 collision marks the key ambiguous, neither owner matches it, and it remains a
 tombstone until the LRU map evicts it. A key whose owner is gone is taken over.
 
-PREROUTING processes SYN-ACK packets with RST clear. It matches the complete key,
+PREROUTING processes SYN-ACK packets with RST clear. Every inbound packet reaches
+it, so a candidate check comes first: one probe read covers the IP header and the TCP
+flags for IPv4 without options and IPv6 without extension headers, and anything
+else in those layouts leaves at once; other layouts go to the full parse. It
+matches the complete key,
 checks registration and ownership, atomically claims the connection,
 and publishes headers. Failure to publish releases the claim. Success marks the
 connection complete and removes its nonambiguous aliases. The terminal state
@@ -179,7 +183,7 @@ production object.
 
 The acceptance runners are in `test/ebpf/`:
 
-- `capture.py`: production collector, 28 cases (TAP, run with `prove`): malformed packets,
+- `capture.py`: production collector, 30 cases (TAP, run with `prove`): malformed packets,
   options/extensions, SYN-data ACK misses, retransmissions, terminal state,
   ambiguous ownership, ACK wraparound, eviction from full maps, stale-owner
   takeover, and

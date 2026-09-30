@@ -202,6 +202,79 @@ synack_parse_packet(struct sk_buff *skb, struct synack_key *key,
 }
 
 
+/*
+ * Whether a packet is a SYN-ACK candidate, worth synack_parse_packet().
+ * synack_in sees every inbound packet, so this looks first: one probe read
+ * covers the IP header and the TCP flags byte for the common layouts, IPv4
+ * without options and IPv6 without extension headers, and decides those.
+ * Returns 0 only where the full parse could not yield a SYN-ACK either; any
+ * other layout is a candidate, left to the full parse.
+ */
+
+#define SYNACK_FLAGS_READ_V4        34      /* IPv4 + TCP up to the flags */
+#define SYNACK_FLAGS_READ_V6        54      /* IPv6 + TCP up to the flags */
+
+static __always_inline int
+synack_candidate(struct sk_buff *skb)
+{
+    __u8            b[SYNACK_FLAGS_READ_V6], next, flags;
+    __u32           offset, tail;
+    unsigned char  *head;
+
+    head = skb->head;
+    offset = skb->network_header;
+    tail = skb->tail;
+
+    if (offset > tail || tail - offset < SYNACK_FLAGS_READ_V4) {
+        return 1;
+    }
+
+    if (tail - offset >= SYNACK_FLAGS_READ_V6) {
+        if (bpf_probe_read_kernel(b, SYNACK_FLAGS_READ_V6, head + offset)) {
+            return 1;
+        }
+
+    } else if (bpf_probe_read_kernel(b, SYNACK_FLAGS_READ_V4, head + offset)) {
+        return 1;
+    }
+
+    if (b[0] >> 4 == 4) {
+
+        if (b[9] != IPPROTO_TCP || (b[6] & 0x3f) || b[7]) {
+            return 0;                   /* not TCP, or a fragment */
+        }
+
+        if (b[0] != 0x45) {
+            return 1;                   /* options: the full parse decides */
+        }
+
+        flags = b[33];
+
+    } else if (b[0] >> 4 == 6) {
+
+        next = b[6];
+
+        if (next != IPPROTO_TCP) {
+            return next == SYNACK_IPV6_HOPOPTS
+                   || next == SYNACK_IPV6_ROUTING
+                   || next == SYNACK_IPV6_DSTOPTS
+                   || next == SYNACK_IPV6_AH;
+        }
+
+        if (tail - offset < SYNACK_FLAGS_READ_V6) {
+            return 1;
+        }
+
+        flags = b[53];
+
+    } else {
+        return 0;
+    }
+
+    return (flags & SYNACK_TCP_FLAGS) == (SYNACK_TCP_SYN|SYNACK_TCP_ACK);
+}
+
+
 /* header_len must come from a successful synack_parse_packet() on skb */
 
 static __always_inline int
@@ -511,6 +584,10 @@ synack_in(struct bpf_nf_ctx *ctx)
     seq = 0;
 
     /* every inbound packet reaches this hook: stay cheap until a match */
+
+    if (!synack_candidate(ctx->skb)) {
+        return SYNACK_NF_ACCEPT;
+    }
 
     flags = synack_parse_packet(ctx->skb, &key, &length, &seq);
 

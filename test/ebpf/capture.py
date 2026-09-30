@@ -182,6 +182,22 @@ class Collector:
             finally:
                 self.clean(cookie)
 
+    def non_synack(self, name, k):
+        # Every inbound packet reaches synack_in; synack_candidate() must turn
+        # these away even with the registered key's exact tuple and ACK.
+        with self.tap.case(name):
+            cookie = self.register(k)
+            try:
+                for flags in (0x10, 0x02, 0x18, 0x11, 0x14):   # ACK SYN PSH|ACK FIN|ACK RST|ACK
+                    self.send(k, packet(k, flags=flags, payload=b"x" * 16))
+                    assert self.get("capture", cookie, Record) is None, hex(flags)
+                    assert self.get("conn", cookie, Connection).phase == 0, hex(flags)
+                # the same key still captures a real SYN-ACK afterwards
+                self.send(k, packet(k))
+                assert self.get("capture", cookie, Record, consume=True)
+            finally:
+                self.clean(cookie)
+
     def synack_lifecycle(self):
         raw_cookie = int.from_bytes(self.raw[2].getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
         cookie = self.register(cookie=raw_cookie)
@@ -415,6 +431,8 @@ def main():
         c.capture_case("short TCP header rejected", k4, packet(k4, tcp_offset=4))
         c.capture_case("inaccessible TCP options rejected", k4, packet(k4, tcp_offset=15))
         c.capture_case("RST SYN-ACK rejected", k4, packet(k4, flags=0x16))
+        c.non_synack("IPv4 non-SYN-ACK packets never captured", k4)
+        c.non_synack("IPv6 non-SYN-ACK packets never captured", k6)
         options = bytearray(packet(k4))
         options[0] = 0x46
         options[2:4] = struct.pack("!H", 44)
