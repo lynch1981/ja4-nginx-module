@@ -71,7 +71,7 @@ jobs:
           path: ${{ env.BUILD_DIR }}/src/objs/autoconf.err
 
   privileged:
-    name: Capture, JA4TS and lifetime (root)
+    name: Capture, JA4TS, lifetime and load (root)
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -84,6 +84,11 @@ jobs:
             libbpf1 python3 perl cpanminus iproute2 nftables util-linux \
             linux-tools-generic linux-tools-common
           sudo cpanm --notest Test::Nginx
+          # soak.py's loss phase uses netem, which the runner kernel ships in
+          # linux-modules-extra.
+          sudo apt-get install -y --no-install-recommends \
+            "linux-modules-extra-$(uname -r)"
+          sudo modprobe sch_netem
           # nginx.py lists BPF maps and links with bpftool. Use the real
           # executable: the wrapper requires a tools package matching the
           # runner's kernel even though bpftool itself does not.
@@ -110,6 +115,9 @@ jobs:
       - name: Nginx lifetime and resource release
         run: |
           sudo -E prove -v --exec python3 test/ebpf/nginx.py :: "$BUILD_DIR/nginx"
+      - name: Correctness under concurrent load
+        run: |
+          sudo -E prove -v --exec python3 test/ebpf/soak.py :: "$BUILD_DIR/nginx"
 
   unprivileged:
     name: Configuration without BPF privileges
