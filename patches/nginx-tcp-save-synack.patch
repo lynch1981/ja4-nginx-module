@@ -86,21 +86,6 @@ diff --git a/src/core/ngx_module.h b/src/core/ngx_module.h
  
  
  #define NGX_MODULE_V1                                                         \
-diff --git a/src/event/ngx_event.c b/src/event/ngx_event.c
---- a/src/event/ngx_event.c
-+++ b/src/event/ngx_event.c
-@@ -675,6 +675,11 @@ ngx_event_process_init(ngx_cycle_t *cycle)
-     if (ngx_event_timer_init(cycle->log) == NGX_ERROR) {
-         return NGX_ERROR;
-     }
-+#if (NGX_HAVE_EBPF)
-+    if (ngx_ebpf_worker_init(cycle) != NGX_OK) {
-+        return NGX_ERROR;
-+    }
-+#endif
- 
-     for (m = 0; cycle->modules[m]; m++) {
-         if (cycle->modules[m]->type != NGX_EVENT_MODULE) {
 diff --git a/src/event/ngx_event_connect.c b/src/event/ngx_event_connect.c
 --- a/src/event/ngx_event_connect.c
 +++ b/src/event/ngx_event_connect.c

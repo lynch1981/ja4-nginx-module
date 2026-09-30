@@ -13,7 +13,6 @@
 
 
 ngx_int_t ngx_ebpf_require(ngx_conf_t *cf);
-ngx_int_t ngx_ebpf_worker_init(ngx_cycle_t *cycle);
 
 void ngx_connection_register_synack(ngx_connection_t *c, struct sockaddr *sa,
     ngx_flag_t enabled);

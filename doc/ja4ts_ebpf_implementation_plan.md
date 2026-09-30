@@ -122,22 +122,27 @@ records yield empty values. Response headers and access logging are supported.
 | Map | Key | Capacity |
 | --- | --- | ---: |
 | `synack_conn` | cookie | 65,536 |
-| `synack_expect` | full tuple + ACK | 262,144 |
+| `synack_expect` | full tuple + ACK | 131,072 |
 | `synack_capture` | cookie | 65,536 |
 | `synack_stats` | counter ID | fixed |
 | `synack_scratch` | zero, per CPU | 1 |
 
-All retention maps are bounded hashes, without LRU eviction. Scratch storage is
-transient. Kernel and userspace failures have diagnostic counters in a shared
+All retention maps are LRU hashes. Scratch storage is transient. Kernel and
+userspace failures have diagnostic counters in a shared
 mmapable statistics array; updates use atomic additions. Counter IDs are private
 and defined in the ABI header. There is no production debug variable or CLI.
 
 Pending metadata expires 120 seconds after the latest supported SYN. Unconsumed
 headers expire after 10 seconds, normally disappearing at immediate handoff.
-Lookup enforces deadlines independently of reclamation. A one-second worker timer
-incrementally scans at most 256 entries per map per tick. A shared three-second
-lease permits worker-failure takeover. Sweeping is bounded fallback reclamation,
-not a promise that every expired entry is deleted within one second at capacity.
+Lookup enforces deadlines independently of reclamation. Capture, consumption and
+close remove entries on the fast path. Nothing sweeps: what a failure leaves
+behind (a crashed worker, a missed SYN-ACK, an ambiguous key) is never looked up
+again, so the LRU maps evict it first when an insert needs room, with bounded
+work per insert and no periodic pass in the kernel or a worker. An expired
+expectation is taken over by the next owner of its key rather than treated as a
+collision. The cost is that an insert never fails for room: past capacity, the
+oldest live entry is evicted. The consumer counts that as `EVICTED` when both
+its registration and its capture are gone.
 
 Ownership lives outside cycle pools. No enabled configuration means no maps or
 attachments. `nginx -t` and signal-only invocations do not touch BPF. Explicitly
@@ -167,15 +172,16 @@ production object.
 
 The acceptance runners are in `test/ebpf/`:
 
-- `capture.py`: production collector, 28 cases (TAP, run with `prove`): malformed packets,
+- `capture.py`: production collector, 29 cases (TAP, run with `prove`): malformed packets,
   options/extensions, SYN-data ACK misses, retransmissions, terminal state,
-  ambiguous ownership, ACK wraparound, bounded-map exhaustion, and
+  ambiguous ownership, ACK wraparound, eviction from full maps, expired-key
+  takeover, and
   separate-namespace IPv4/IPv6/mapped/NAT/untracked peers. It is also the
   cross-kernel CO-RE check.
 - `nginx.py`: instrumented Nginx, immediate consumption before response variables,
-  resources after a failed unprivileged startup, allocation and registration failures,
-  worker capability drop and replacement, expiry lease takeover, reload and
-  shutdown.
+  resources after a failed unprivileged startup, allocation failure, eviction from
+  a full registration map and the eviction counter, worker capability drop and
+  replacement, reload and shutdown.
 - `build-matrix.sh`: production HTTP, HTTP plus stream, and disabled builds.
 - `test/ja4ts-config.t`: non-root directive parsing (including `stream {}`), the
   build without the addon, and the clear failure of an unprivileged enabled

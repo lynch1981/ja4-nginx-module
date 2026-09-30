@@ -224,8 +224,15 @@ synack_copy_headers(struct sk_buff *skb, __u8 *bytes, __u32 header_len)
 }
 
 
+/*
+ * Capture, consume and close remove entries on the fast path.  What a failure
+ * leaves behind (a crashed worker, a missed SYN-ACK, an ambiguous key) is
+ * never looked up again, so the LRU maps evict it first when an insert needs
+ * room; no sweep runs.  Lookups ignore expired entries meanwhile.
+ */
+
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, SYNACK_CONNECTIONS);
     __type(key, __u64);                         /* socket cookie */
     __type(value, struct synack_connection);
@@ -233,7 +240,7 @@ struct {
 
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, SYNACK_EXPECTATIONS);
     __type(key, struct synack_key);
     __type(value, struct synack_expectation);
@@ -241,7 +248,7 @@ struct {
 
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, SYNACK_CONNECTIONS);
     __type(key, __u64);                         /* socket cookie */
     __type(value, struct synack_record);
@@ -329,7 +336,7 @@ synack_add_expectation(struct synack_key *key, __u64 cookie,
     if (e == NULL
         && bpf_map_update_elem(&synack_expect, key, &value, BPF_NOEXIST))
     {
-        /* lost an insert race, or the map is full */
+        /* lost an insert race */
 
         e = bpf_map_lookup_elem(&synack_expect, key);
         if (e == NULL) {
@@ -339,20 +346,30 @@ synack_add_expectation(struct synack_key *key, __u64 cookie,
     }
 
     if (e) {
-        if (e->cookie != cookie) {
+        if (e->deadline <= now) {
 
             /*
-             * Never replace another owner.  An expired key stays unavailable
-             * until the userspace sweeper removes it.
+             * An expired key, e.g. one a crashed worker left behind, is
+             * taken over as if absent.  The deadline goes last: until then
+             * synack_in still sees an expired key and ignores it.
              */
+
+            e->cookie = cookie;
+            __sync_lock_test_and_set(&e->ambiguous, 0);
+            e->deadline = value.deadline;
+
+        } else if (e->cookie != cookie) {
+
+            /* never replace another live owner */
 
             __sync_lock_test_and_set(&e->ambiguous, 1);
             e->deadline = value.deadline;
             synack_count(SYNACK_STAT_COLLISION);
             return;
-        }
 
-        e->deadline = value.deadline;
+        } else {
+            e->deadline = value.deadline;
+        }
     }
 
     if (slot == SYNACK_MAX_ALIASES) {

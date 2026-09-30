@@ -5,14 +5,14 @@
  * The master loads the BPF object and attaches it to Netfilter PREROUTING and
  * POSTROUTING; workers inherit the map descriptors.  A connection registers
  * its socket cookie before connect(), consumes the captured SYN-ACK headers
- * once the socket is established, and unregisters when it is closed.  One
- * worker at a time holds a lease to sweep entries left behind by crashes.
+ * once the socket is established, and unregisters when it is closed.  The
+ * maps are LRU: what failures leave behind, e.g. after a crashed worker, is
+ * evicted when an insert needs the room.
  */
 
 
 #include <ngx_config.h>
 #include <ngx_core.h>
-#include <ngx_event.h>
 
 #include <sys/mman.h>
 #include <stdarg.h>
@@ -35,29 +35,11 @@
  * one: INT_MIN + 1, + 2, ... and INT_MAX - 1, - 2, ...
  */
 #define NGX_EBPF_PRIORITIES     64
-#define NGX_EBPF_SWEEP_MSEC     1000
-#define NGX_EBPF_LEASE_SEC      3
-
-/* Sweep a sixty-fourth of each map per tick. */
-#define NGX_EBPF_SWEEP_CONN     (SYNACK_CONNECTIONS / 64)
-#define NGX_EBPF_SWEEP_EXPECT   (SYNACK_EXPECTATIONS / 64)
 
 
 typedef struct {
     ngx_flag_t                  enabled;
 } ngx_ebpf_conf_t;
-
-
-typedef void (*ngx_ebpf_expire_pt)(int fd, void *key, uint64_t now);
-
-typedef struct {
-    int                        *fd;
-    size_t                      key_size;
-    ngx_uint_t                  budget;
-    ngx_ebpf_expire_pt          expire;
-    ngx_uint_t                  valid;
-    u_char                      cursor[sizeof(struct synack_key)];
-} ngx_ebpf_sweeper_t;
 
 
 static void *ngx_ebpf_create_conf(ngx_cycle_t *cycle);
@@ -66,13 +48,7 @@ static void ngx_ebpf_exit(ngx_cycle_t *cycle);
 static int ngx_ebpf_libbpf_print(enum libbpf_print_level level,
     const char *fmt, va_list args);
 static uint64_t ngx_ebpf_now(void);
-static void ngx_ebpf_remove(uint64_t cookie, ngx_uint_t consumed);
-static void ngx_ebpf_sweep(ngx_event_t *ev);
-static ngx_uint_t ngx_ebpf_take_lease(uint64_t now);
-static void ngx_ebpf_sweep_map(ngx_ebpf_sweeper_t *sw, uint64_t now);
-static void ngx_ebpf_expire_conn(int fd, void *key, uint64_t now);
-static void ngx_ebpf_expire_capture(int fd, void *key, uint64_t now);
-static void ngx_ebpf_expire_expect(int fd, void *key, uint64_t now);
+static ngx_uint_t ngx_ebpf_remove(uint64_t cookie, ngx_uint_t consumed);
 
 
 static ngx_core_module_t  ngx_ebpf_module_ctx = {
@@ -108,20 +84,7 @@ static int                  ngx_ebpf_capture_fd = -1;
 static ngx_uint_t           ngx_ebpf_started;
 static ngx_log_t           *ngx_ebpf_log;
 static ngx_uint_t           ngx_ebpf_quiet;
-static uint64_t            *ngx_ebpf_lease;
 static uint64_t            *ngx_ebpf_stats;
-static ngx_event_t          ngx_ebpf_timer;
-static ngx_connection_t     ngx_ebpf_timer_connection;
-
-
-static ngx_ebpf_sweeper_t  ngx_ebpf_sweepers[] = {
-    { &ngx_ebpf_conn_fd, sizeof(uint64_t), NGX_EBPF_SWEEP_CONN,
-      ngx_ebpf_expire_conn, 0, { 0 } },
-    { &ngx_ebpf_capture_fd, sizeof(uint64_t), NGX_EBPF_SWEEP_CONN,
-      ngx_ebpf_expire_capture, 0, { 0 } },
-    { &ngx_ebpf_expect_fd, sizeof(struct synack_key), NGX_EBPF_SWEEP_EXPECT,
-      ngx_ebpf_expire_expect, 0, { 0 } }
-};
 
 
 #define ngx_ebpf_count(stat)                                                  \
@@ -272,15 +235,6 @@ ngx_ebpf_init(ngx_cycle_t *cycle)
                       "further in", skipped);
     }
 
-    ngx_ebpf_lease = mmap(NULL, sizeof(uint64_t), PROT_READ|PROT_WRITE,
-                          MAP_SHARED|MAP_ANONYMOUS, -1, 0);
-    if (ngx_ebpf_lease == MAP_FAILED) {
-        ngx_ebpf_lease = NULL;
-        goto failed;
-    }
-
-    *ngx_ebpf_lease = 0;
-
     ngx_ebpf_log = NULL;
 
     return NGX_OK;
@@ -361,31 +315,6 @@ ngx_ebpf_libbpf_print(enum libbpf_print_level level, const char *fmt,
 }
 
 
-ngx_int_t
-ngx_ebpf_worker_init(ngx_cycle_t *cycle)
-{
-    if (ngx_ebpf_skel == NULL
-        || (ngx_process != NGX_PROCESS_WORKER
-            && ngx_process != NGX_PROCESS_SINGLE))
-    {
-        return NGX_OK;
-    }
-
-    ngx_memzero(&ngx_ebpf_timer, sizeof(ngx_event_t));
-
-    ngx_ebpf_timer_connection.fd = (ngx_socket_t) -1;
-
-    ngx_ebpf_timer.handler = ngx_ebpf_sweep;
-    ngx_ebpf_timer.data = &ngx_ebpf_timer_connection;
-    ngx_ebpf_timer.log = cycle->log;
-    ngx_ebpf_timer.cancelable = 1;
-
-    ngx_add_timer(&ngx_ebpf_timer, NGX_EBPF_SWEEP_MSEC);
-
-    return NGX_OK;
-}
-
-
 static void
 ngx_ebpf_exit(ngx_cycle_t *cycle)
 {
@@ -417,11 +346,6 @@ ngx_ebpf_exit(ngx_cycle_t *cycle)
     ngx_ebpf_conn_fd = -1;
     ngx_ebpf_expect_fd = -1;
     ngx_ebpf_capture_fd = -1;
-
-    if (ngx_ebpf_lease) {
-        (void) munmap(ngx_ebpf_lease, sizeof(uint64_t));
-        ngx_ebpf_lease = NULL;
-    }
 }
 
 
@@ -502,6 +426,7 @@ ngx_connection_save_synack(ngx_connection_t *c)
     u_char                *buf;
     uint64_t               now, cookie;
     socklen_t              len;
+    ngx_uint_t             registered;
     struct tcp_info        info;
     struct synack_record   record;
 
@@ -532,6 +457,13 @@ ngx_connection_save_synack(ngx_connection_t *c)
 
     cookie = c->synack_cookie;
 
+#if (NGX_SYNACK_TEST)
+    if (getenv("NGX_SYNACK_TEST_EVICT")) {
+        (void) bpf_map_delete_elem(ngx_ebpf_capture_fd, &cookie);
+        (void) bpf_map_delete_elem(ngx_ebpf_conn_fd, &cookie);
+    }
+#endif
+
     rc = bpf_map_lookup_and_delete_elem(ngx_ebpf_capture_fd, &cookie,
                                         &record);
 
@@ -540,11 +472,22 @@ ngx_connection_save_synack(ngx_connection_t *c)
      * has already deleted it in BPF, and a missed one can no longer happen.
      */
 
-    ngx_connection_cleanup_synack(c);
+    registered = ngx_ebpf_remove(cookie, 1);
+    c->synack_cookie = 0;
 
     if (rc < 0) {
         if (rc != -ENOENT) {
             ngx_ebpf_count(SYNACK_STAT_HANDOFF_ERROR);
+
+        } else if (!registered) {
+
+            /*
+             * A missed SYN-ACK leaves the registration pending, and a capture
+             * replaces it with the record: with neither left, the LRU maps
+             * evicted one of them.
+             */
+
+            ngx_ebpf_count(SYNACK_STAT_EVICTED);
         }
 
         return;
@@ -610,7 +553,7 @@ ngx_connection_cleanup_synack(ngx_connection_t *c)
         return;
     }
 
-    ngx_ebpf_remove(c->synack_cookie, c->synack_processed);
+    (void) ngx_ebpf_remove(c->synack_cookie, c->synack_processed);
 
     c->synack_cookie = 0;
 }
@@ -618,21 +561,24 @@ ngx_connection_cleanup_synack(ngx_connection_t *c)
 
 /*
  * "consumed" means the connection has already taken (or discarded) its
- * capture record, so only the registration is left to delete.
+ * capture record, so only the registration is left to delete.  Returns
+ * whether the registration still existed.
  */
 
-static void
+static ngx_uint_t
 ngx_ebpf_remove(uint64_t cookie, ngx_uint_t consumed)
 {
-    ngx_uint_t                  i;
+    ngx_uint_t                  i, registered;
     struct synack_connection    state;
     struct synack_expectation   owner;
 
+    registered = bpf_map_lookup_and_delete_elem(ngx_ebpf_conn_fd, &cookie,
+                                                &state)
+                 == 0;
+
     /* a completed capture has already removed the keys it owned in BPF */
 
-    if (bpf_map_lookup_and_delete_elem(ngx_ebpf_conn_fd, &cookie, &state) == 0
-        && state.phase != SYNACK_COMPLETE)
-    {
+    if (registered && state.phase != SYNACK_COMPLETE) {
         for (i = 0; i < state.count && i < SYNACK_MAX_ALIASES; i++) {
 
             if (bpf_map_lookup_elem(ngx_ebpf_expect_fd, &state.keys[i],
@@ -650,133 +596,6 @@ ngx_ebpf_remove(uint64_t cookie, ngx_uint_t consumed)
     if (!consumed) {
         (void) bpf_map_delete_elem(ngx_ebpf_capture_fd, &cookie);
     }
-}
 
-
-static void
-ngx_ebpf_sweep(ngx_event_t *ev)
-{
-    uint64_t    now;
-    ngx_uint_t  i;
-
-    now = ngx_ebpf_now();
-
-    if (ngx_ebpf_take_lease(now)) {
-        for (i = 0; i < sizeof(ngx_ebpf_sweepers)
-                        / sizeof(ngx_ebpf_sweeper_t); i++)
-        {
-            ngx_ebpf_sweep_map(&ngx_ebpf_sweepers[i], now);
-        }
-    }
-
-    ngx_add_timer(ev, NGX_EBPF_SWEEP_MSEC);
-}
-
-
-/*
- * The lease word holds the expiry second in the high 32 bits and the owner
- * pid in the low 32 bits.  The owner renews it on every tick; any worker may
- * take it over once it has expired, e.g. after the owner crashed.
- */
-
-static ngx_uint_t
-ngx_ebpf_take_lease(uint64_t now)
-{
-    uint64_t  lease, wanted, sec;
-
-    sec = now / SYNACK_NSEC_PER_SEC;
-    lease = *ngx_ebpf_lease;
-    wanted = ((sec + NGX_EBPF_LEASE_SEC) << 32) | (uint32_t) ngx_pid;
-
-    if ((uint32_t) lease != (uint32_t) ngx_pid && (lease >> 32) > sec) {
-        return 0;
-    }
-
-    return __sync_bool_compare_and_swap(ngx_ebpf_lease, lease, wanted);
-}
-
-
-/*
- * Visits up to sw->budget keys per tick and resumes from the saved cursor on
- * the next tick; after the last key the walk restarts from the first one.
- */
-
-static void
-ngx_ebpf_sweep_map(ngx_ebpf_sweeper_t *sw, uint64_t now)
-{
-    int         more;
-    u_char      current[sizeof(struct synack_key)];
-    u_char      next[sizeof(struct synack_key)];
-    ngx_uint_t  i;
-
-    for (i = 0; i < sw->budget; i++) {
-
-        if (!sw->valid
-            && bpf_map_get_next_key(*sw->fd, NULL, sw->cursor) != 0)
-        {
-            break;
-        }
-
-        ngx_memcpy(current, sw->cursor, sw->key_size);
-
-        more = bpf_map_get_next_key(*sw->fd, current, next) == 0;
-
-        sw->expire(*sw->fd, current, now);
-
-        if (more) {
-            ngx_memcpy(sw->cursor, next, sw->key_size);
-        }
-
-        sw->valid = more;
-
-        if (!more) {
-            break;
-        }
-    }
-}
-
-
-static void
-ngx_ebpf_expire_conn(int fd, void *key, uint64_t now)
-{
-    uint64_t                   cookie;
-    struct synack_connection   state;
-
-    cookie = *(uint64_t *) key;
-
-    if (bpf_map_lookup_elem(fd, &cookie, &state) == 0
-        && state.deadline <= now)
-    {
-        ngx_ebpf_count(SYNACK_STAT_EXPIRED);
-        ngx_ebpf_remove(cookie, 0);
-    }
-}
-
-
-static void
-ngx_ebpf_expire_capture(int fd, void *key, uint64_t now)
-{
-    struct synack_record  record;
-
-    if (bpf_map_lookup_elem(fd, key, &record) == 0
-        && now >= record.timestamp
-        && now - record.timestamp >= SYNACK_CAPTURE_NS)
-    {
-        ngx_ebpf_count(SYNACK_STAT_EXPIRED);
-        (void) bpf_map_delete_elem(fd, key);
-    }
-}
-
-
-static void
-ngx_ebpf_expire_expect(int fd, void *key, uint64_t now)
-{
-    struct synack_expectation  expectation;
-
-    if (bpf_map_lookup_elem(fd, key, &expectation) == 0
-        && expectation.deadline <= now)
-    {
-        ngx_ebpf_count(SYNACK_STAT_EXPIRED);
-        (void) bpf_map_delete_elem(fd, key);
-    }
+    return registered;
 }

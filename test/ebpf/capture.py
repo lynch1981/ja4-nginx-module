@@ -63,16 +63,23 @@ def packet(k, *, flags=0x12, seq=100, payload=b"", extensions=0,
                        bytes(k.src), bytes(k.dst)) + ext + tcp + payload
 
 
+# LRU maps keep a per-CPU cache of free slots, and a map only a few slots
+# deep can evict while other CPUs still hold free ones: keep the test maps
+# large enough for that never to happen, and overfill them to test eviction.
+CAPACITY = {"conn": 1024, "expect": 2048, "capture": 1024}
+
+
 class Collector:
     def __init__(self, path, tap):
         self.tap = tap
         self.proof = Loader(path, programs=(b"synack_in", b"synack_out"),
                            map_name=b"synack_conn", capacities={
-                               b"synack_conn": 16, b"synack_expect": 32,
-                               b"synack_capture": 2})
+                               ("synack_" + name).encode(): size
+                               for name, size in CAPACITY.items()})
         self.lib = self.proof.lib
         self.fds = {name: self.lib.bpf_object__find_map_fd_by_name(self.proof.obj,
-                    ("synack_" + name).encode()) for name in ("conn", "expect", "capture", "stats")}
+                    ("synack_" + name).encode())
+                    for name in ("conn", "expect", "capture", "stats")}
         self.raw = {family: socket.socket(family, socket.SOCK_RAW, socket.IPPROTO_RAW)
                     for family in (2, 10)}
         self.raw[10].setsockopt(socket.IPPROTO_IPV6, 36, 1)  # IPV6_HDRINCL
@@ -110,6 +117,14 @@ class Collector:
                 keys.append(Tuple.from_buffer_copy(k))
             prev = C.byref(Tuple.from_buffer_copy(k))
         return keys
+
+    def entries(self, name):
+        k = (Tuple if name == "expect" else C.c_uint64)()
+        n, prev = 0, None
+        while self.lib.bpf_map_get_next_key(self.fds[name], prev, C.byref(k)) == 0:
+            n += 1
+            prev = C.byref(type(k).from_buffer_copy(k))
+        return n
 
     def counter(self, number):
         return self.get("stats", C.c_uint32(number), C.c_uint64).value
@@ -298,21 +313,21 @@ class Collector:
             self.clean(first)
             self.clean(second)
 
-    def expectation_exhaustion(self):
-        keys = [key(ack=10000+i) for i in range(32)]
+    def expectation_eviction(self):
+        # A full expectation map evicts instead of refusing the SYN's keys.
+        future = time.monotonic_ns() + 120_000_000_000
+        keys = [key(ack=10000+i) for i in range(2 * CAPACITY["expect"])]
         for k in keys:
-            self.put("expect", k, Expectation(123, time.monotonic_ns()+120_000_000_000))
+            self.put("expect", k, Expectation(123, future))
         raw_cookie = int.from_bytes(self.raw[2].getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
         cookie = self.register(cookie=raw_cookie)
         outgoing = key(src="127.0.0.2", dst="127.0.0.1", sport=40300, dport=40301, ack=0)
         try:
+            assert self.entries("expect") <= CAPACITY["expect"]
             before = self.counter(0)
             self.send(outgoing, packet(outgoing, flags=2, seq=0xffffffff))
-            assert self.counter(0) > before
-            assert self.get("conn", cookie, Connection).count == 0
-            for k in keys:
-                self.delete("expect", k)
-            self.send(outgoing, packet(outgoing, flags=2, seq=0xffffffff))
+            assert self.counter(0) == before
+            assert self.get("conn", cookie, Connection).count > 0
             reply = key(src="127.0.0.1", dst="127.0.0.2", sport=40301, dport=40300, ack=0)
             self.send(reply, packet(reply))
             assert self.get("capture", cookie, Record)
@@ -321,8 +336,9 @@ class Collector:
                 self.delete("expect", k)
             self.clean(cookie)
 
-    def capture_exhaustion(self):
-        held = [self.register() for _ in range(2)]
+    def capture_eviction(self):
+        # A full capture map makes room by evicting the oldest records.
+        held = [self.register() for _ in range(2 * CAPACITY["capture"])]
         for cookie in held:
             self.put("capture", cookie, Record(version=1, length=40, timestamp=time.monotonic_ns()))
         k = key()
@@ -330,26 +346,42 @@ class Collector:
         try:
             before = self.counter(3)
             self.send(k, packet(k))
-            assert self.counter(3) > before
-            assert self.get("conn", cookie, Connection).phase == 0
-            self.delete("capture", held[0])
-            self.send(k, packet(k))
+            assert self.counter(3) == before
             assert self.get("capture", cookie, Record)
+            assert self.entries("capture") <= CAPACITY["capture"]
         finally:
             for c in held + [cookie]:
                 self.clean(c)
 
-    def connection_bound(self):
-        held = [self.register() for _ in range(16)]
+    def connection_eviction(self):
+        # Registering never fails for room: the oldest registrations go.
+        held = [self.register() for _ in range(2 * CAPACITY["conn"])]
         try:
-            try:
-                self.register()
-                raise AssertionError("connection map exceeded capacity")
-            except OSError as e:
-                assert e.errno in (errno.E2BIG, errno.ENOSPC)
+            assert self.entries("conn") <= CAPACITY["conn"]
+            assert self.get("conn", held[-1], Connection)
         finally:
             for c in held:
                 self.clean(c)
+
+    def expired_takeover(self):
+        # A key someone left behind expires into a free key: the next owner
+        # takes it over instead of both being blocked as a collision.
+        outgoing = key(src="127.0.0.2", dst="127.0.0.1", sport=40500, dport=40501, ack=0)
+        reply = key(src="127.0.0.1", dst="127.0.0.2", sport=40501, dport=40500, ack=101)
+        self.put("expect", reply, Expectation(123, time.monotonic_ns() - 1, 1))
+        raw_cookie = int.from_bytes(self.raw[2].getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
+        cookie = self.register(cookie=raw_cookie)
+        try:
+            before = self.counter(2)
+            self.send(outgoing, packet(outgoing, flags=2))
+            e = self.get("expect", reply, Expectation)
+            assert e.cookie == cookie.value and e.ambiguous == 0, (e.cookie, e.ambiguous)
+            assert self.counter(2) == before
+            self.send(reply, packet(reply))
+            assert self.get("capture", cookie, Record)
+        finally:
+            self.delete("expect", reply)
+            self.clean(cookie)
 
 
 def main():
@@ -381,7 +413,7 @@ def main():
         c.capture_case("short TCP header rejected", k4, packet(k4, tcp_offset=4))
         c.capture_case("inaccessible TCP options rejected", k4, packet(k4, tcp_offset=15))
         c.capture_case("RST SYN-ACK rejected", k4, packet(k4, flags=0x16))
-        c.capture_case("expired registration/expectation rejected before sweeping", k4, packet(k4), expired=True)
+        c.capture_case("expired registration/expectation rejected", k4, packet(k4), expired=True)
         options = bytearray(packet(k4))
         options[0] = 0x46
         options[2:4] = struct.pack("!H", 44)
@@ -396,10 +428,12 @@ def main():
             ("ACK of SYN data misses, retransmission retention, alias limit, terminal state",
              c.synack_lifecycle),
             ("colliding full keys remain ambiguous for both owners", c.collisions),
-            ("expectation exhaustion recovers; ACK arithmetic wraps at 32 bits",
-             c.expectation_exhaustion),
-            ("capture exhaustion releases claim for a later response", c.capture_exhaustion),
-            ("bounded connection map", c.connection_bound),
+            ("full expectation map evicts; ACK arithmetic wraps at 32 bits",
+             c.expectation_eviction),
+            ("full capture map evicts for a new capture", c.capture_eviction),
+            ("full connection map evicts for a new registration", c.connection_eviction),
+            ("an expired key left behind is taken over, not a collision",
+             c.expired_takeover),
         ]:
             with tap.case(name):
                 case()

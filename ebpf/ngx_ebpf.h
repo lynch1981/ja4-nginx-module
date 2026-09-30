@@ -75,7 +75,11 @@ struct synack_record {
 };
 
 
-/* Indexes into the synack_stats array; the tests read them by number. */
+/*
+ * Indexes into the synack_stats array; the tests read them by number, so new
+ * counters are appended.  The maps are LRU: an insert evicts instead of
+ * failing, so the *_FULL counters only count lost insert races.
+ */
 
 enum synack_stat {
     SYNACK_STAT_EXPECT_FULL = 0,
@@ -88,6 +92,7 @@ enum synack_stat {
     SYNACK_STAT_ALLOC_FAILED,
     SYNACK_STAT_HANDOFF_ERROR,
     SYNACK_STAT_INVALID_RECORD,
+    SYNACK_STAT_EVICTED,                /* registration or capture evicted */
     SYNACK_STAT_COUNT
 };
 

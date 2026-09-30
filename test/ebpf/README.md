@@ -22,7 +22,7 @@ enables raw-header inspection and fault injection without adding production
 variables.
 `nginx.py` checks `nginx -V` first and exits with the missing option if the
 build doesn't qualify. Use a separate build for deployment; production does
-not recognize `NGX_SYNACK_TEST_ALLOC_FAIL`.
+not recognize `NGX_SYNACK_TEST_ALLOC_FAIL` or `NGX_SYNACK_TEST_EVICT`.
 
 ```sh
 sudo -E prove -v --exec python3 test/ebpf/capture.py
@@ -59,13 +59,14 @@ Each case belongs to the lowest layer that can observe it.
 
 - **`capture.py`: the collector, driven directly.** It extracts the object
   embedded in the committed skeleton, exactly what nginx ships, loads it with
-  small test map capacities and reports 29 TAP points: 28 cases plus the remote
-  namespace setup:
+  test map capacities (1024 registrations and captures, 2048 expectations)
+  and reports 30 TAP points: 29 cases plus the remote namespace setup:
   - crafted packets: payload exclusion, IPv4 options, IPv6 extension limits,
     fragments, jumbograms, ESP, bad TCP offsets, and RST
   - deadlines, SYN-data ACK misses, retransmission alias retention,
     terminal state, colliding ownership, and ACK wraparound
-  - exhaustion of all three bounded maps
+  - eviction from all three LRU maps when overfilled to twice their capacity,
+    and an expired key left behind taken over by its next owner
   - real TCP to a backend in a separate namespace: IPv4, IPv6, an IPv4-mapped
     socket, untracked traffic, and DNAT/SNAT
   Nginx cannot produce these packets or map states. Run the **same object** on
@@ -103,8 +104,10 @@ Each case belongs to the lowest layer that can observe it.
   - no BPF resources leaked by a startup that fails without privileges
   - unprivileged workers
   - atomic handoff before response variables, checked in the maps
-  - allocation and registration failure, and aborted-connect cleanup
-  - lease takeover after a worker is killed
+  - allocation failure, a full registration map evicting while capture keeps
+    working, the eviction counter (`NGX_SYNACK_TEST_EVICT`), and
+    aborted-connect cleanup
+  - worker replacement
   - reload policy and resource reuse
   - final map and link release
   - concurrent capture-enabled instances in one namespace, each at the next

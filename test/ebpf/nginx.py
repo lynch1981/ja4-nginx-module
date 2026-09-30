@@ -163,6 +163,7 @@ master_process on;
 user nobody nogroup;
 worker_processes 1;
 env NGX_SYNACK_TEST_ALLOC_FAIL;
+env NGX_SYNACK_TEST_EVICT;
 pid {self.root}/nginx.pid;
 error_log {self.log} notice;
 events {{ worker_connections 128; }}
@@ -352,23 +353,10 @@ def test_http(binary, tap):
             assert b"X-FP: []" in n.request("/off")
             assert len(n.handoffs()) == 1
 
-        with tap.case("worker replacement, shared links, sweep lease takeover", stop=True):
-            # Kill the lease holder and verify the replacement sweeps expired state.
-            fake = (1 << 62)
-            # Observe the original worker sweep first, so it owns a live lease.
-            n.maps.put("conn", fake-1, Connection(deadline=time.monotonic_ns()-1))
-            n.maps.put("capture", fake-2, Record(version=1, length=40,
-                                                timestamp=time.monotonic_ns()-11_000_000_000))
-            wait(lambda: n.maps.get("conn", fake-1, Connection) is None)
-            wait(lambda: n.maps.get("capture", fake-2, Record) is None)
-            n.maps.put("conn", fake, Connection(deadline=time.monotonic_ns()-1))
-            n.maps.put("capture", fake, Record(version=1, length=40,
-                                              timestamp=time.monotonic_ns()-11_000_000_000))
+        with tap.case("worker replacement and shared links", stop=True):
             old = n.worker()
             os.kill(old, signal.SIGKILL)
             wait(lambda: n.worker() and n.worker() != old)
-            wait(lambda: n.maps.get("conn", fake, Connection) is None, timeout=7)
-            assert n.maps.get("capture", fake, Record) is None
             assert re.search(rb"X-FP: \[\d+_", n.request())
 
         with tap.case("reload reuses maps and changes policy for new sockets", stop=True):
@@ -377,7 +365,9 @@ def test_http(binary, tap):
             n.reload(True)
             assert re.search(rb"X-FP: \[\d+_", n.request())
 
-        with tap.case("registration exhaustion preserves proxy traffic", stop=True):
+        with tap.case("a full registration map evicts; capture keeps working", stop=True):
+            # e.g. registrations crashed workers left behind: the LRU map
+            # evicts them for new ones instead of refusing to register
             wait(lambda: n.maps.empty("conn"))
             state = Connection(deadline=time.monotonic_ns()+120_000_000_000)
             start = 1 << 61
@@ -386,9 +376,9 @@ def test_http(binary, tap):
                 for i in range(count):
                     n.maps.put("conn", start+i, state)
                 response = n.request()
-                assert b"200 OK" in response and b"X-FP: []" in response
-                assert "registration failed, metadata unavailable" in n.log.read_text()
-                assert n.maps.get("stats", 6, C.c_uint64).value == 1
+                assert b"200 OK" in response and re.search(rb"X-FP: \[\d+_", response)
+                assert "registration failed" not in n.log.read_text()
+                assert n.maps.get("stats", 6, C.c_uint64).value == 0      # REGISTER_FAILED
             finally:
                 for i in range(count):
                     n.maps.delete("conn", start+i)
@@ -424,6 +414,25 @@ def test_allocation(binary, tap):
             assert b"200 OK" in response and b"X-FP: []" in response
             assert not n.handoffs()
             assert n.maps.get("stats", 7, C.c_uint64).value == 1
+            wait(lambda: n.maps.empty("capture") and n.maps.empty("conn"))
+        finally:
+            n.close()
+            backend.close()
+
+
+def test_eviction(binary, tap):
+    with tap.case("an evicted registration or capture is counted at consume"):
+        # the instrumented build deletes both just before consuming, as the
+        # LRU maps would under pressure
+        backend = Backend()
+        n = Nginx(binary, True, env={"NGX_SYNACK_TEST_EVICT": "1"})
+        try:
+            n.start()
+            response = n.request()
+            assert b"200 OK" in response and b"X-FP: []" in response
+            assert not n.handoffs()
+            assert n.maps.get("stats", 10, C.c_uint64).value == 1       # EVICTED
+            assert n.maps.get("stats", 8, C.c_uint64).value == 0        # HANDOFF_ERROR
             wait(lambda: n.maps.empty("capture") and n.maps.empty("conn"))
         finally:
             n.close()
@@ -554,7 +563,7 @@ def main():
         Tap.bail(f"cannot enter a private network namespace: {e}")
     tap = Tap()
     for test in (test_default, test_startup_failure, test_http, test_allocation,
-                 test_shared_hooks, test_upgrade):
+                 test_eviction, test_shared_hooks, test_upgrade):
         try:
             test(binary, tap)
         except Exception:
