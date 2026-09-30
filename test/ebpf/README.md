@@ -69,7 +69,9 @@ Each case belongs to the lowest layer that can observe it.
   - real TCP to a backend in a separate namespace: IPv4, IPv6, an IPv4-mapped
     socket, untracked traffic, and DNAT/SNAT
   Nginx cannot produce these packets or map states. Run the **same object** on
-  each target kernel to check CO-RE relocation.
+  each target kernel to check CO-RE relocation. CI runs it on the runner's
+  kernel and, in the `kernel-6-4` job, on Ubuntu's mainline 6.4.0 build (the
+  oldest kernel with Netfilter BPF links) booted with virtme-ng under KVM.
 - **`ja4ts-config.t`: directive parsing, without root.** It runs against the
   SYN-ACK patch both with and without the addon, and covers:
   - invalid values, and the main and `upstream` contexts
@@ -144,5 +146,7 @@ namespace takes its own hook priorities (at most 64 at once) and its own maps;
 during a binary upgrade the old and new masters capture side by side, and
 nothing is handed over. Privileged CI errors instead of silently skipping
 capture coverage.
-Rerun `capture.py` unchanged on both supported baseline kernels when changing
-CO-RE accesses or packet reads.
+When changing CO-RE accesses or packet reads, check that `capture.py` passes
+unchanged in both CI kernel jobs. To reproduce the 6.4 run locally, follow the
+job's steps: `virtme-ng`, the kernel's modules copied into `/lib/modules` (never
+extract the package into `/`), and `vng --verbose`.

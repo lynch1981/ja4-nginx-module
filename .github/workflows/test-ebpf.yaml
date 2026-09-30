@@ -119,6 +119,77 @@ jobs:
         run: |
           sudo -E prove -v --exec python3 test/ebpf/soak.py :: "$BUILD_DIR/nginx"
 
+  kernel-6-4:
+    name: Collector on the oldest supported kernel (6.4)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # Ubuntu's mainline build: kernel BTF and NETFILTER_BPF_LINK built in
+      KERNEL_URL: https://kernel.ubuntu.com/mainline/v6.4/amd64
+      KERNEL_BUILD: "6.4.0-060400.202306271339"
+      KERNEL_RELEASE: "6.4.0-060400-generic"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          # virtme-ng boots the kernel in QEMU over the runner's filesystem;
+          # capture.py needs no nginx build, only the committed skeleton.
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libbpf1 python3 iproute2 nftables util-linux kmod \
+            virtme-ng qemu-system-x86 busybox-static
+          test -e /dev/kvm || { echo "::error::no /dev/kvm on this runner"; exit 1; }
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kernel
+          key: ubuntu-mainline-${{ env.KERNEL_BUILD }}
+      - name: Fetch the kernel and its modules
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/kernel"
+          mkdir -p "$dir"
+          # Unpacked side by side (never into /): vng loads the modules from
+          # lib/modules next to boot/vmlinuz.
+          for pkg in linux-image-unsigned linux-modules; do
+            deb="$dir/$pkg.deb"
+            [ -s "$deb" ] || curl -fsSLo "$deb" \
+              "$KERNEL_URL/$pkg-${KERNEL_RELEASE}_${KERNEL_BUILD}_amd64.deb"
+            dpkg-deb -x "$deb" "$dir/root"
+          done
+      - name: capture.py on 6.4
+        run: |
+          # The guest sees the runner's filesystem except /tmp. It marks that
+          # it started, so a failed boot can be retried but a test failure
+          # cannot.
+          started="$RUNNER_TEMP/guest-started"
+          cat > "$RUNNER_TEMP/guest.sh" <<EOF
+          #!/bin/sh
+          set -e
+          touch "$started"
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          test "\$(uname -r)" = "$KERNEL_RELEASE"
+          cd "$GITHUB_WORKSPACE"
+          prove -v --exec python3 test/ebpf/capture.py
+          EOF
+          chmod 755 "$RUNNER_TEMP/guest.sh"
+          set -o pipefail
+          for attempt in 1 2 3; do
+            rm -f "$started"
+            # Without a terminal, vng needs --verbose to boot and to return
+            # the guest's exit status, and stdio it can reopen through
+            # /proc/self/fd: /dev/null and a pipe, never a file or socket.
+            if sudo vng --run "$RUNNER_TEMP/kernel/root/boot/vmlinuz-$KERNEL_RELEASE" \
+                 --memory 2G --user root --verbose --exec "$RUNNER_TEMP/guest.sh" \
+                 < /dev/null 2>&1 | cat; then
+              exit 0
+            fi
+            if [ -e "$started" ]; then
+              exit 1
+            fi
+            echo "::warning::the 6.4 guest failed to boot (attempt $attempt)"
+          done
+          exit 1
+
   unprivileged:
     name: Configuration without BPF privileges
     needs: build
