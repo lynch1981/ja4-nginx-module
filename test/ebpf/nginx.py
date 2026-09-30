@@ -164,6 +164,7 @@ user nobody nogroup;
 worker_processes 1;
 env NGX_SYNACK_TEST_ALLOC_FAIL;
 env NGX_SYNACK_TEST_EVICT;
+env NGX_SYNACK_TEST_MISS;
 pid {self.root}/nginx.pid;
 error_log {self.log} notice;
 events {{ worker_connections 128; }}
@@ -352,6 +353,8 @@ def test_http(binary, tap):
             wait(lambda: n.maps.empty("conn"))
             assert b"X-FP: []" in n.request("/off")
             assert len(n.handoffs()) == 1
+            assert n.maps.get("stats", 10, C.c_uint64).value == 0       # EVICTED
+            assert n.maps.get("stats", 11, C.c_uint64).value == 0       # MISSED
 
         with tap.case("worker replacement and shared links", stop=True):
             old = n.worker()
@@ -434,6 +437,27 @@ def test_eviction(binary, tap):
             assert n.maps.get("stats", 10, C.c_uint64).value == 1       # EVICTED
             assert n.maps.get("stats", 8, C.c_uint64).value == 0        # HANDOFF_ERROR
             wait(lambda: n.maps.empty("capture") and n.maps.empty("conn"))
+        finally:
+            n.close()
+            backend.close()
+
+
+def test_miss(binary, tap):
+    with tap.case("a registered connection whose SYN-ACK was missed is counted at consume"):
+        # the instrumented build registers already expired, so synack_out
+        # records no keys and the SYN-ACK matches nothing
+        backend = Backend()
+        n = Nginx(binary, True, env={"NGX_SYNACK_TEST_MISS": "1"})
+        try:
+            n.start()
+            response = n.request()
+            assert b"200 OK" in response and b"X-FP: []" in response
+            assert not n.handoffs()
+            assert n.maps.get("stats", 11, C.c_uint64).value == 1       # MISSED
+            assert n.maps.get("stats", 10, C.c_uint64).value == 0       # EVICTED
+            assert n.maps.get("stats", 4, C.c_uint64).value == 0        # CAPTURED
+            # consume removed the pending registration
+            wait(lambda: n.maps.empty("conn") and n.maps.empty("expect"))
         finally:
             n.close()
             backend.close()
@@ -563,7 +587,7 @@ def main():
         Tap.bail(f"cannot enter a private network namespace: {e}")
     tap = Tap()
     for test in (test_default, test_startup_failure, test_http, test_allocation,
-                 test_eviction, test_shared_hooks, test_upgrade):
+                 test_eviction, test_miss, test_shared_hooks, test_upgrade):
         try:
             test(binary, tap)
         except Exception:

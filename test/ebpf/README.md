@@ -22,7 +22,7 @@ enables raw-header inspection and fault injection without adding production
 variables.
 `nginx.py` checks `nginx -V` first and exits with the missing option if the
 build doesn't qualify. Use a separate build for deployment; production does
-not recognize `NGX_SYNACK_TEST_ALLOC_FAIL` or `NGX_SYNACK_TEST_EVICT`.
+not recognize the `NGX_SYNACK_TEST_*` environment variables.
 
 ```sh
 sudo -E prove -v --exec python3 test/ebpf/capture.py
@@ -105,8 +105,8 @@ Each case belongs to the lowest layer that can observe it.
   - unprivileged workers
   - atomic handoff before response variables, checked in the maps
   - allocation failure, a full registration map evicting while capture keeps
-    working, the eviction counter (`NGX_SYNACK_TEST_EVICT`), and
-    aborted-connect cleanup
+    working, the eviction and miss counters (`NGX_SYNACK_TEST_EVICT`,
+    `NGX_SYNACK_TEST_MISS`), and aborted-connect cleanup
   - worker replacement
   - reload policy and resource reuse
   - final map and link release

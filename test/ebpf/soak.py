@@ -34,7 +34,7 @@ from nginx import Maps, resources, wait
 
 STATS = ["EXPECT_FULL", "ALIAS_FULL", "COLLISION", "CAPTURE_FULL", "CAPTURED",
          "EXPIRED", "REGISTER_FAILED", "ALLOC_FAILED", "HANDOFF_ERROR",
-         "INVALID_RECORD", "EVICTED"]
+         "INVALID_RECORD", "EVICTED", "MISSED"]
 
 # route suffix -> backend address; the ports' SYN-ACKs differ
 BACKENDS = {"a": "192.0.2.2:23456", "b": "192.0.2.2:23457",

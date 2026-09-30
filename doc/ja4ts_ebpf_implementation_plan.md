@@ -142,7 +142,10 @@ work per insert and no periodic pass in the kernel or a worker. An expired
 expectation is taken over by the next owner of its key rather than treated as a
 collision. The cost is that an insert never fails for room: past capacity, the
 oldest live entry is evicted. The consumer counts that as `EVICTED` when both
-its registration and its capture are gone.
+its registration and its capture are gone. It counts `MISSED` when the
+registration is still pending, i.e. the SYN-ACK was not captured. The insert and
+collision counters explain some misses; unexplained ones mean traffic took a
+path the programs cannot see, or a bug.
 
 Ownership lives outside cycle pools. No enabled configuration means no maps or
 attachments. `nginx -t` and signal-only invocations do not touch BPF. Explicitly
@@ -180,7 +183,7 @@ The acceptance runners are in `test/ebpf/`:
   cross-kernel CO-RE check.
 - `nginx.py`: instrumented Nginx, immediate consumption before response variables,
   resources after a failed unprivileged startup, allocation failure, eviction from
-  a full registration map and the eviction counter, worker capability drop and
+  a full registration map, the eviction and miss counters, worker capability drop and
   replacement, reload and shutdown.
 - `build-matrix.sh`: production HTTP, HTTP plus stream, and disabled builds.
 - `test/ja4ts-config.t`: non-root directive parsing (including `stream {}`), the

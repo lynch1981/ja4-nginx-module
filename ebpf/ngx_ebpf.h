@@ -93,6 +93,7 @@ enum synack_stat {
     SYNACK_STAT_HANDOFF_ERROR,
     SYNACK_STAT_INVALID_RECORD,
     SYNACK_STAT_EVICTED,                /* registration or capture evicted */
+    SYNACK_STAT_MISSED,                 /* registered, but nothing captured */
     SYNACK_STAT_COUNT
 };
 

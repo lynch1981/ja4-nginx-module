@@ -398,6 +398,13 @@ ngx_connection_register_synack(ngx_connection_t *c, struct sockaddr *sa,
     ngx_memzero(&state, sizeof(struct synack_connection));
     state.deadline = ngx_ebpf_now() + SYNACK_PENDING_NS;
 
+#if (NGX_SYNACK_TEST)
+    if (getenv("NGX_SYNACK_TEST_MISS")) {
+        /* already expired: synack_out ignores it, so its SYN-ACK is missed */
+        state.deadline = ngx_ebpf_now() - 1;
+    }
+#endif
+
     rc = bpf_map_update_elem(ngx_ebpf_conn_fd, &cookie, &state, BPF_NOEXIST);
 
     if (rc < 0) {
@@ -479,12 +486,22 @@ ngx_connection_save_synack(ngx_connection_t *c)
         if (rc != -ENOENT) {
             ngx_ebpf_count(SYNACK_STAT_HANDOFF_ERROR);
 
-        } else if (!registered) {
+        } else if (registered) {
 
             /*
-             * A missed SYN-ACK leaves the registration pending, and a capture
-             * replaces it with the record: with neither left, the LRU maps
-             * evicted one of them.
+             * The registration is still pending: the SYN-ACK was not
+             * captured.  The *_FULL, ALIAS_FULL and COLLISION counters
+             * explain some misses; the rest took a path the programs cannot
+             * see, or are bugs.
+             */
+
+            ngx_ebpf_count(SYNACK_STAT_MISSED);
+
+        } else {
+
+            /*
+             * A capture replaces the registration with the record: with
+             * neither left, the LRU maps evicted one of them.
              */
 
             ngx_ebpf_count(SYNACK_STAT_EVICTED);
