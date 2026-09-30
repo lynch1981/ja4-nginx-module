@@ -43,10 +43,13 @@ priority, so a process that finds them taken (another capture-enabled nginx,
 or the old master during a binary upgrade) uses the next free ones inward, up
 to 64. Every path returns `NF_ACCEPT` and leaves bytes alone.
 
-POSTROUTING processes SYN packets with ACK/RST clear, obtains the socket from
-hook state (falling back to `skb->sk`), reads the initialized cookie with CO-RE,
-and requires a live pending registration. For packet sequence S, it deduplicates
-up to two incoming expectation keys:
+POSTROUTING processes SYN packets with ACK/RST clear. It obtains the socket from
+hook state (falling back to `skb->sk`) and lets every other packet through
+before the map lookup, reading two socket fields with CO-RE: the state (only
+`SYN_SENT` sends SYNs; `CLOSE` also passes, for unconnected raw and UDP
+sockets) and the cookie (zero until requested, which nginx does before
+registering). It then requires a live pending registration. For packet
+sequence S, it deduplicates up to two incoming expectation keys:
 
 | Tuple | ACK |
 | --- | --- |

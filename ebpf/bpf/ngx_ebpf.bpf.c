@@ -399,13 +399,18 @@ int
 synack_out(struct bpf_nf_ctx *ctx)
 {
     int                          flags;
+    __u8                         state;
     __u32                        length, seq, local, remote;
     __u64                        cookie;
     struct sock                 *sk;
     struct synack_key            packet = {}, wire = {}, original = {};
     struct synack_connection    *c;
 
-    /* every outbound packet reaches this hook: a cookie lookup gates it */
+    /*
+     * Every outbound packet in the namespace reaches this hook, and only a
+     * registered socket's SYN matters: two field reads let everything else
+     * through before the map lookup.
+     */
 
     sk = ctx->state->sk;
     if (sk == NULL) {
@@ -416,7 +421,26 @@ synack_out(struct bpf_nf_ctx *ctx)
         return SYNACK_NF_ACCEPT;
     }
 
+    /*
+     * A TCP socket sends SYNs (first and retransmitted) only in SYN_SENT.
+     * Established TCP and connected UDP, the bulk of traffic, stop here.
+     * CLOSE passes too: unconnected raw and UDP sockets report it (capture.py
+     * injects crafted SYNs from a raw socket), and a TCP socket in CLOSE sends
+     * no data; they stop at the cookie check.  The SYN flag is still checked
+     * once the headers are parsed.
+     */
+
+    state = sk->__sk_common.skc_state;
+    if (state != TCP_SYN_SENT && state != TCP_CLOSE) {
+        return SYNACK_NF_ACCEPT;
+    }
+
+    /* the cookie is assigned on first use; nginx asks before registering */
+
     cookie = sk->__sk_common.skc_cookie.counter;
+    if (cookie == 0) {
+        return SYNACK_NF_ACCEPT;
+    }
 
     c = bpf_map_lookup_elem(&synack_conn, &cookie);
 
