@@ -188,8 +188,8 @@ Known limitations:
 - Unprivileged workers are verified on Linux 6.8. On 6.4, kernels with
   `kernel.unprivileged_bpf_disabled` set may refuse map access from non-root
   workers; this is unverified.
-See the [implementation and lifetime details](doc/ja4ts_ebpf_implementation_plan.md)
-and [privileged tests](test/ebpf/README.md).
+See the [design document](doc/ja4ts_ebpf_design.md) and the
+[privileged tests](test/ebpf/README.md).
 
 ## Testing
 
