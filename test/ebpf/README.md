@@ -105,6 +105,9 @@ Each case belongs to the lowest layer that can observe it.
   - lease takeover after a worker is killed
   - reload policy and resource reuse
   - final map and link release
+  - concurrent capture-enabled instances in one namespace, each at the next
+    free hook priority, and a clear failure once all 64 are taken
+  - binary upgrade (`USR2`): the new master captures beside the old one
 - **`soak.py`: correctness under concurrent load.** Either build. A capture-enabled
   nginx proxies to a second nginx in another namespace; the backend's three
   ports answer with different SYN-ACKs, so a fingerprint handed to the wrong
@@ -136,7 +139,10 @@ nginx does not use TCP Fast Open upstream, so a SYN-ACK acknowledging SYN data
 does not match.
 Earlier XDP/TC/OUTPUT/other-namespace rewrites cannot be recovered. Headers
 outside the linear skb head are not read. There is no stream capture, no
-retransmission-time/RST suffix, and no live binary upgrade handover in this
-version. Privileged CI errors instead of silently skipping capture coverage.
+retransmission-time/RST suffix. Each capture-enabled nginx in a network
+namespace takes its own hook priorities (at most 64 at once) and its own maps;
+during a binary upgrade the old and new masters capture side by side, and
+nothing is handed over. Privileged CI errors instead of silently skipping
+capture coverage.
 Rerun `capture.py` unchanged on both supported baseline kernels when changing
 CO-RE accesses or packet reads.

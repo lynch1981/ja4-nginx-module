@@ -38,7 +38,10 @@ production reader executable is required.
 
 The master attaches both PREROUTING programs before either POSTROUTING program,
 in its own network namespace. The default priorities are `INT_MIN + 1` and
-`INT_MAX - 1`, respectively. Every path returns `NF_ACCEPT` and leaves bytes alone.
+`INT_MAX - 1`, respectively. Netfilter allows one BPF program per hook and
+priority, so a process that finds them taken (another capture-enabled nginx,
+or the old master during a binary upgrade) uses the next free ones inward, up
+to 64. Every path returns `NF_ACCEPT` and leaves bytes alone.
 
 POSTROUTING processes SYN packets with ACK/RST clear, obtains the socket from
 hook state (falling back to `skb->sk`), reads the initialized cookie with CO-RE,
@@ -199,6 +202,6 @@ production variants in parallel. Existing JA4T regression assertions remain
 part of CI. See the fixture README for commands.
 
 Deferred scope: TCP Fast Open on upstream connections, retransmission timing/RST
-suffixes, stream capture, non-linear skb
-headers, and live binary upgrade. Capture is optional metadata and individual losses leave
+suffixes, stream capture, and non-linear skb
+headers. Capture is optional metadata and individual losses leave
 normal proxy behavior unchanged.

@@ -28,6 +28,13 @@
 
 
 #define NGX_EBPF_LINKS          4       /* {PRE,POST}ROUTING x {IPv4,IPv6} */
+
+/*
+ * Netfilter refuses a second BPF program at the same hook and priority, so
+ * each capture-enabled process in a network namespace takes the next free
+ * one: INT_MIN + 1, + 2, ... and INT_MAX - 1, - 2, ...
+ */
+#define NGX_EBPF_PRIORITIES     64
 #define NGX_EBPF_SWEEP_MSEC     1000
 #define NGX_EBPF_LEASE_SEC      3
 
@@ -100,6 +107,7 @@ static int                  ngx_ebpf_expect_fd = -1;
 static int                  ngx_ebpf_capture_fd = -1;
 static ngx_uint_t           ngx_ebpf_started;
 static ngx_log_t           *ngx_ebpf_log;
+static ngx_uint_t           ngx_ebpf_quiet;
 static uint64_t            *ngx_ebpf_lease;
 static uint64_t            *ngx_ebpf_stats;
 static ngx_event_t          ngx_ebpf_timer;
@@ -151,8 +159,9 @@ static ngx_int_t
 ngx_ebpf_init(ngx_cycle_t *cycle)
 {
     ngx_err_t                   err;
-    ngx_uint_t                  i;
+    ngx_uint_t                  i, n, skipped;
     ngx_ebpf_conf_t            *conf;
+    struct bpf_link            *link;
     struct bpf_program         *prog;
     struct bpf_netfilter_opts   opts;
 
@@ -206,6 +215,8 @@ ngx_ebpf_init(ngx_cycle_t *cycle)
 
     /* both PREROUTING links precede either POSTROUTING link */
 
+    skipped = 0;
+
     for (i = 0; i < NGX_EBPF_LINKS; i++) {
         ngx_memzero(&opts, sizeof(struct bpf_netfilter_opts));
         opts.sz = sizeof(struct bpf_netfilter_opts);
@@ -214,22 +225,51 @@ ngx_ebpf_init(ngx_cycle_t *cycle)
         if (i < 2) {
             prog = ngx_ebpf_skel->progs.synack_in;
             opts.hooknum = NF_INET_PRE_ROUTING;
-            opts.priority = INT_MIN + 1;
 
         } else {
             prog = ngx_ebpf_skel->progs.synack_out;
             opts.hooknum = NF_INET_POST_ROUTING;
-            opts.priority = INT_MAX - 1;
         }
 
-        ngx_ebpf_links[i] = bpf_program__attach_netfilter(prog, &opts);
+        link = NULL;
+        err = NGX_EBUSY;
 
-        if (ngx_ebpf_links[i] == NULL
-            || libbpf_get_error(ngx_ebpf_links[i]))
-        {
-            ngx_ebpf_links[i] = NULL;
+        for (n = 0; n < NGX_EBPF_PRIORITIES; n++) {
+            opts.priority = (i < 2) ? INT_MIN + 1 + (int) n
+                                    : INT_MAX - 1 - (int) n;
+
+            /* a taken priority is expected; libbpf would warn each time */
+
+            ngx_ebpf_quiet = 1;
+            link = bpf_program__attach_netfilter(prog, &opts);
+            err = ngx_errno;
+            ngx_ebpf_quiet = 0;
+
+            if (link != NULL && libbpf_get_error(link) == 0) {
+                break;
+            }
+
+            link = NULL;
+
+            if (err != NGX_EBUSY) {
+                break;
+            }
+        }
+
+        if (link == NULL) {
+            ngx_set_errno(err);
             goto failed;
         }
+
+        ngx_ebpf_links[i] = link;
+        skipped = ngx_max(skipped, n);
+    }
+
+    if (skipped) {
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "tcp_save_synack: other processes capture in this "
+                      "network namespace; attached %ui hook priorities "
+                      "further in", skipped);
     }
 
     ngx_ebpf_lease = mmap(NULL, sizeof(uint64_t), PROT_READ|PROT_WRITE,
@@ -249,7 +289,13 @@ failed:
 
     err = ngx_errno;
 
-    if (err == NGX_EPERM || err == NGX_EACCES) {
+    if (err == NGX_EBUSY) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, err,
+                      "tcp_save_synack: all %d Netfilter hook priorities "
+                      "for capture are taken by other processes in this "
+                      "network namespace", NGX_EBPF_PRIORITIES);
+
+    } else if (err == NGX_EPERM || err == NGX_EACCES) {
         ngx_log_error(NGX_LOG_EMERG, cycle->log, err,
                       "tcp_save_synack: cannot load the BPF capture "
                       "programs; the master process needs root, or "
@@ -272,6 +318,8 @@ failed:
 /*
  * libbpf warnings are logged at the notice level: the emerg message above
  * reports the failure, and "error_log ... notice" shows libbpf's reasons.
+ * Attach attempts are quiet: a taken priority is expected, and the emerg
+ * message carries the errno of the last attempt.
  */
 
 static int
@@ -281,6 +329,10 @@ ngx_ebpf_libbpf_print(enum libbpf_print_level level, const char *fmt,
     int         n;
     char        buf[NGX_MAX_ERROR_STR];
     ngx_log_t  *log;
+
+    if (ngx_ebpf_quiet) {
+        return 0;
+    }
 
     log = ngx_ebpf_log ? ngx_ebpf_log : ngx_cycle->log;
 

@@ -20,7 +20,7 @@ import threading
 import time
 
 from capture import Connection, Record
-from fixture import Stop, Tap, command, namespace
+from fixture import Attach, Loader, Stop, Tap, command, namespace, skeleton_object
 
 
 def wait(check, timeout=8):
@@ -139,8 +139,9 @@ class Backend:
 
 
 class Nginx:
-    def __init__(self, binary, enabled=None, *, env=None):
+    def __init__(self, binary, enabled=None, *, env=None, port=18080):
         self.binary = binary
+        self.port = port
         self.temp = tempfile.TemporaryDirectory(prefix="synack-nginx-")
         self.root = Path(self.temp.name)
         self.root.chmod(0o755)
@@ -168,7 +169,7 @@ events {{ worker_connections 128; }}
 http {{
     access_log off;
     {policy}
-    server {{ listen 127.0.0.1:18080;
+    server {{ listen 127.0.0.1:{self.port};
         location /ready {{ return 200 "ready"; }}
         location /on {{ proxy_pass http://127.0.0.1:23456;
             add_header X-FP "[$upstream_ja4ts]" always; }}
@@ -210,8 +211,8 @@ http {{
         children = Path(f"/proc/{self.proc.pid}/task/{self.proc.pid}/children").read_text().split()
         return int(children[-1]) if children else None
 
-    def begin(self, path="/on", port=18080):
-        client = socket.create_connection(("127.0.0.1", port), timeout=5)
+    def begin(self, path="/on", port=None):
+        client = socket.create_connection(("127.0.0.1", port or self.port), timeout=5)
         client.sendall(f"GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n".encode())
         return client
 
@@ -225,7 +226,7 @@ http {{
                     return data
                 data += block
 
-    def request(self, path="/on", port=18080):
+    def request(self, path="/on", port=None):
         return self.finish(self.begin(path, port))
 
     def handoffs(self):
@@ -429,6 +430,116 @@ def test_allocation(binary, tap):
             backend.close()
 
 
+def test_shared_hooks(binary, tap):
+    # Netfilter allows one BPF program per hook and priority; each instance
+    # takes the next free priority.
+    shifted = "attached 1 hook priorities further in"
+    with tap.case("concurrent instances share the hooks; a freed priority is reused"):
+        backend, first, second, third = Backend(), None, None, None
+        try:
+            first = Nginx(binary, True, port=18080)
+            first.start()
+            second = Nginx(binary, True, port=18081)
+            second.start()
+            assert shifted not in first.log.read_text()
+            assert shifted in second.log.read_text()
+            for n in (first, second):
+                assert re.search(rb"X-FP: \[\d+_", n.request()), n.port
+            first.close()
+            first = None
+            assert re.search(rb"X-FP: \[\d+_", second.request())
+            third = Nginx(binary, True, port=18082)
+            third.start()
+            assert "hook priorities further in" not in third.log.read_text()
+            assert re.search(rb"X-FP: \[\d+_", third.request())
+        finally:
+            for n in (first, second, third):
+                if n:
+                    n.close()
+            backend.close()
+
+    with tap.case("all hook priorities taken fails clearly and leaks nothing"):
+        path = skeleton_object()
+        holder, links = None, []
+        try:
+            # The loader holds INT_MIN + 1; take the rest of the IPv4
+            # PREROUTING range with the same program.
+            holder = Loader(path, programs=(b"synack_in", b"synack_out"),
+                            map_name=b"synack_conn")
+            lib = holder.lib
+            prog = lib.bpf_object__find_program_by_name(holder.obj, b"synack_in")
+            for i in range(2, 65):
+                opts = Attach(C.sizeof(Attach), socket.AF_INET, 0, -2**31 + i, 0)
+                link = lib.bpf_program__attach_netfilter(prog, C.byref(opts))
+                assert link and not lib.libbpf_get_error(link), i
+                links.append(link)
+            n = Nginx(binary, True)
+            try:
+                result = subprocess.run([binary, "-p", str(n.root), "-c", str(n.path)],
+                                        capture_output=True, timeout=8)
+                assert result.returncode != 0
+                assert b"all 64 Netfilter hook priorities for capture are taken" in result.stderr, \
+                    result.stderr
+                assert b"libbpf:" not in result.stderr
+                # maps and links were created before the attach failed;
+                # the kernel frees them after an RCU grace period
+                wait(lambda: set(resources()) == set(n.before_maps))
+                wait(lambda: set(resources("link")) == set(n.before_links))
+            finally:
+                n.close()
+        finally:
+            for link in links:
+                holder.lib.bpf_link__destroy(link)
+            if holder:
+                holder.close()
+            os.unlink(path)
+
+
+def test_upgrade(binary, tap):
+    with tap.case("binary upgrade: the new master captures beside the old one"):
+        # daemonized: a master whose parent is unchanged ignores SIGUSR2
+        backend, n = Backend(), Nginx(binary, True)
+        n.path.write_text(n.path.read_text().replace("daemon off;", "daemon on;"))
+        pid, oldbin = n.root/"nginx.pid", n.root/"nginx.pid.oldbin"
+        old = new = None
+        fingerprint = lambda: re.search(rb"X-FP: \[\d+_", n.request())
+        added = lambda kind, before: set(resources(kind)) - set(before)
+        try:
+            command(binary, "-p", str(n.root), "-c", str(n.path))
+            old = int(pid.read_text())
+            wait(lambda: len(added("link", n.before_links)) == 4)
+            old_maps = added("map", n.before_maps)
+            assert fingerprint()
+            os.kill(old, signal.SIGUSR2)
+            wait(lambda: oldbin.exists() and pid.exists() and int(pid.read_text()) != old)
+            new = int(pid.read_text())
+            # its own maps, and links one hook priority further in
+            wait(lambda: len(added("link", n.before_links)) == 8)
+            assert "attached 1 hook priorities further in" in n.log.read_text()
+            os.kill(old, signal.SIGWINCH)
+            children = Path(f"/proc/{old}/task/{old}/children")
+            wait(lambda: children.read_text().split() == [str(new)])
+            for _ in range(3):
+                assert fingerprint()
+            os.kill(old, signal.SIGQUIT)
+            wait(lambda: not Path(f"/proc/{old}").exists())
+            old = None
+            wait(lambda: not old_maps.intersection(resources()))
+            wait(lambda: len(added("link", n.before_links)) == 4)
+            assert fingerprint()
+            os.kill(new, signal.SIGQUIT)
+            wait(lambda: not Path(f"/proc/{new}").exists())
+            new = None
+            wait(lambda: not added("map", n.before_maps))
+            wait(lambda: not added("link", n.before_links))
+        finally:
+            for master in (old, new):
+                if master:
+                    os.kill(master, signal.SIGKILL)
+            n.close()
+            backend.close()
+
+
 def main():
     if len(sys.argv) != 2:
         Tap.bail("usage: sudo python3 test/ebpf/nginx.py /path/to/instrumented/nginx")
@@ -442,7 +553,8 @@ def main():
     except Exception as e:
         Tap.bail(f"cannot enter a private network namespace: {e}")
     tap = Tap()
-    for test in (test_default, test_startup_failure, test_http, test_allocation):
+    for test in (test_default, test_startup_failure, test_http, test_allocation,
+                 test_shared_hooks, test_upgrade):
         try:
             test(binary, tap)
         except Exception:
