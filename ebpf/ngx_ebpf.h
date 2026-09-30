@@ -1,7 +1,7 @@
 
 /*
- * Types and limits shared by the nginx eBPF loader (ngx_ebpf_module.c) and
- * its BPF programs (bpf/ngx_ebpf.bpf.c).  The map layouts are a private
+ * Types and limits shared by the nginx side (ngx_ebpf_module.c, the loader,
+ * and ngx_ebpf_synack.c) and the BPF programs (bpf/ngx_ebpf.bpf.c).  The map layouts are a private
  * contract: both sides must be built from the same revision.
  */
 

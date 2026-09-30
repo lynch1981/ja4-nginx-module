@@ -113,9 +113,11 @@ patch -p1 < "$ja4_module_dir/patches/nginx-tcp-save-synack.patch"
 make
 ```
 
-The `ebpf/` addon is the Nginx eBPF loader: `ngx_ebpf_module.c`, the shared
-`ngx_ebpf.h`, and the kernel-side sources in `ebpf/bpf/`. The compiled BPF
-programs are embedded in the committed `ebpf/ngx_ebpf.skel.h`, a libbpf skeleton.
+The `ebpf/` addon is the Nginx eBPF loader. `ngx_ebpf_module.c` loads and
+attaches the BPF object, `ngx_ebpf_synack.c` registers, consumes and releases
+each upstream connection's capture, and `ngx_ebpf.h` is shared with the
+kernel-side sources in `ebpf/bpf/`. The compiled BPF programs are embedded in
+the committed `ebpf/ngx_ebpf.skel.h`, a libbpf skeleton.
 The object is CO-RE, so this one skeleton loads on every supported kernel.
 
 After changing `ebpf/bpf/ngx_ebpf.bpf.c` or `ebpf/ngx_ebpf.h`, regenerate and

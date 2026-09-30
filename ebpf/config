@@ -14,9 +14,11 @@ fi
 
 ngx_module_type=CORE
 ngx_module_name=ngx_ebpf_module
-ngx_module_srcs="$ngx_addon_dir/ngx_ebpf_module.c"
+ngx_module_srcs="$ngx_addon_dir/ngx_ebpf_module.c \
+                 $ngx_addon_dir/ngx_ebpf_synack.c"
 ngx_module_incs="$ngx_addon_dir"
 ngx_module_deps="$ngx_addon_dir/ngx_ebpf_module.h \
+                 $ngx_addon_dir/ngx_ebpf_synack.h \
                  $ngx_addon_dir/ngx_ebpf.h \
                  $ngx_addon_dir/ngx_ebpf.skel.h"
 ngx_module_libs="$(pkg-config --libs libbpf)"
