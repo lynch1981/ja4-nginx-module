@@ -1,17 +1,18 @@
 # SYN-ACK capture tests
 
-Three privileged suites cover the `ebpf/` addon. Missing dependencies,
-load/verifier failures, and assertion failures are errors; there are no
-successful skips. Run them sequentially: `nginx.py` checks system-wide BPF
-resource IDs for leaks.
+Four privileged suites cover the `ebpf/` addon, and `bench.py` reports its
+overhead. Missing dependencies, load/verifier failures, and assertion failures
+are errors; there are no successful skips. Run them sequentially: `nginx.py`
+and `soak.py` check system-wide BPF resource IDs for leaks.
 
 Dependencies: root, kernel BTF, libbpf 1.3+, Python 3.9+, iproute2, util-linux
-(`nsenter`), nftables and Test::Nginx. No BPF compiler is needed: the suites use
-the object embedded in the committed `ebpf/ngx_ebpf.skel.h`. `nginx.py` also
+(`nsenter`), nftables and Test::Nginx; `wrk` for `bench.py`. No BPF compiler
+is needed: the suites use the object embedded in the committed
+`ebpf/ngx_ebpf.skel.h`. `nginx.py` also
 needs `bpftool`, to list the maps and links nginx creates; set `BPFTOOL` to the
 real executable when the distro wrapper expects a tools package matching the
 running kernel. On Ubuntu 24.04, install `libbpf-dev libelf-dev iproute2
-nftables linux-tools-generic`.
+nftables linux-tools-generic wrk`.
 
 ## Build
 
@@ -29,6 +30,8 @@ sudo -E env JA4TS_REQUIRE_CAPTURE_TESTS=1 \
     TEST_NGINX_BINARY=/path/to/nginx/objs/nginx \
     prove -v test/ja4ts-variables.t test/ja4ts-network.t
 sudo -E prove -v --exec python3 test/ebpf/nginx.py :: /path/to/instrumented/nginx
+sudo -E prove -v --exec python3 test/ebpf/soak.py :: /path/to/nginx/objs/nginx
+sudo -E python3 test/ebpf/bench.py /path/to/nginx/objs/nginx
 sh test/ebpf/build-matrix.sh /path/to/nginx-1.31.4.tar.gz /tmp/new-build-matrix
 ```
 
@@ -102,6 +105,28 @@ Each case belongs to the lowest layer that can observe it.
   - lease takeover after a worker is killed
   - reload policy and resource reuse
   - final map and link release
+- **`soak.py`: correctness under concurrent load.** Either build. A capture-enabled
+  nginx proxies to a second nginx in another namespace; the backend's three
+  ports answer with different SYN-ACKs, so a fingerprint handed to the wrong
+  connection shows up in the response. Phases: a fresh upstream connection per
+  request, keepalive, both mixed, and 3% loss plus 5% duplication (netem) on
+  the backend's egress. Each phase checks:
+  - every response carries its route's fingerprint
+  - `CAPTURED` equals nginx's upstream connects, and the failure counters stay 0
+  - map occupancy stays bounded by the client count
+  - all three maps drain right after the load, without the sweeper
+  Then nothing is logged at warn or above, and shutdown releases every map and
+  link. `SOAK_SECONDS` (default 5) and `SOAK_CONCURRENCY` (16) set the load;
+  raise them for long soak runs. Needs `tc` with `sch_netem`.
+- **`bench.py`: overhead report, not a test.** The same topology driven by
+  `wrk`, with capture on and off in alternating rounds. It reports median
+  requests/s and p50/p99 latency for fresh and keepalive upstream connections,
+  plus each BPF program's ns/run and runs/request from a separate run with
+  `kernel.bpf_stats_enabled` (restored afterwards). Compare runs on the same
+  machine only; on VMs whose clocksource is not TSC (e.g. hpet), clock reads are
+  slow, both inside the programs and in the statistics. `BENCH_SECONDS`,
+  `BENCH_ROUNDS`, `BENCH_CONNECTIONS`, `BENCH_THREADS` and `BENCH_WORKERS` set
+  the run. Needs `wrk`.
 - **`build-matrix.sh`: production builds.** It builds HTTP, HTTP plus stream,
   and capture-disabled trees from fresh sources.
 
