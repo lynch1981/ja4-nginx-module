@@ -20,21 +20,15 @@ env:
   BUILD_DIR: /tmp/ebpf-ci
 
 jobs:
-  skeleton:
-    name: Committed BPF skeleton is current
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Compare ngx_ebpf.skel.h with its inputs
-        run: sh ebpf/gen-skel.sh --check
-
   build:
-    name: Build instrumented nginx
+    name: Check the BPF skeleton and build instrumented nginx
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      # First, so the tests never run a stale object.
+      - name: Committed ngx_ebpf.skel.h matches its inputs
+        run: sh ebpf/gen-skel.sh --check
       - name: Install build dependencies
         run: |
           # No BPF toolchain: nginx compiles the committed ngx_ebpf.skel.h.
