@@ -562,8 +562,11 @@ microbenchmark instead.
 - **Other early rewrites.** Rewrites by local OUTPUT or another namespace before
   early PREROUTING cannot be undone either. Arbitrary TCP sequence rewriting is
   not supported.
-- **Out of scope:** stream proxying, TCP Fast Open on upstream connections, and
-  retransmission timing or RST suffixes.
+- **Out of scope:** stream proxying, and retransmission timing or RST
+  suffixes.
+- **TCP Fast Open:** stock nginx never uses it on upstream connections. If a
+  patched build did and the server accepted the SYN data, that connection
+  would count as `MISSED`, never get a wrong fingerprint.
 - **64 instances.** At most 64 capture-enabled processes per network namespace.
 - **Unprivileged workers on 6.4** with `kernel.unprivileged_bpf_disabled` set are
   unverified.
