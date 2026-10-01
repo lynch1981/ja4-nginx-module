@@ -38,6 +38,7 @@ RUN wget https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_
 COPY config /tmp/ja4-nginx-module/config
 COPY src/ngx_http_ssl_ja4_module.c.dummy /tmp/ja4-nginx-module/src/ngx_http_ssl_ja4_module.c
 COPY src/ngx_http_ja4t.c.dummy /tmp/ja4-nginx-module/src/ngx_http_ja4t.c
+COPY src/ngx_ssl_ja4_client_hello.c.dummy /tmp/ja4-nginx-module/src/ngx_ssl_ja4_client_hello.c
 COPY patches/nginx-tcp-save-syn.patch /tmp/ja4-nginx-module/patches/nginx-tcp-save-syn.patch
 
 WORKDIR /tmp/nginx-${NGINX_VERSION}
@@ -73,7 +74,7 @@ RUN make -j$(nproc) && \
 # Patch nginx
 COPY . /tmp/ja4-nginx-module
 WORKDIR /tmp/nginx-${NGINX_VERSION}
-RUN patch -p1 < /tmp/ja4-nginx-module/patches/nginx.patch
+RUN patch -p1 < /tmp/ja4-nginx-module/patches/nginx-ssl-save-client-hello.patch
 
 # Rebuild only what's changed in the nginx patch or module
 RUN make -j$(nproc) && \
