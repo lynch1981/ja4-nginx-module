@@ -312,7 +312,7 @@ synack_copy_headers(struct sk_buff *skb, __u8 *bytes, __u32 header_len)
 
 /*
  * Capture, consume and close remove entries on the fast path.  What a failure
- * leaves behind (a crashed worker, a missed SYN-ACK, an ambiguous key) is
+ * leaves behind (a crashed worker, a missed SYN-ACK) is
  * never looked up again, so the LRU maps evict it first when an insert needs
  * room; no sweep runs, and nothing needs the clock.
  */
@@ -379,9 +379,7 @@ synack_remove_owned(struct synack_key *key, __u64 cookie)
 
     e = bpf_map_lookup_elem(&synack_expect, key);
 
-    /* ambiguous keys stay as tombstones until the LRU map evicts them */
-
-    if (e && e->cookie == cookie && !e->ambiguous) {
+    if (e && e->cookie == cookie) {
         bpf_map_delete_elem(&synack_expect, key);
     }
 }
@@ -438,11 +436,14 @@ synack_add_expectation(struct synack_key *key, __u64 cookie,
 
     if (e && e->cookie != cookie) {
 
+        /*
+         * Another live connection already expects this key: the same tuple
+         * and initial sequence number, which only crafted traffic produces.
+         * The first owner keeps it; a SYN-ACK matching it is captured for
+         * that owner, and this connection misses.
+         */
+
         if (synack_owner_alive(e->cookie)) {
-
-            /* never replace another live owner */
-
-            __sync_lock_test_and_set(&e->ambiguous, 1);
             synack_count(SYNACK_STAT_COLLISION);
             return;
         }
@@ -454,7 +455,6 @@ synack_add_expectation(struct synack_key *key, __u64 cookie,
          */
 
         e->cookie = cookie;
-        __sync_lock_test_and_set(&e->ambiguous, 0);
     }
 
     if (!c->has_key) {
@@ -581,7 +581,7 @@ synack_in(struct bpf_nf_ctx *ctx)
 
     e = bpf_map_lookup_elem(&synack_expect, &key);
 
-    if (e == NULL || e->ambiguous) {
+    if (e == NULL) {
         return SYNACK_NF_ACCEPT;
     }
 
@@ -610,11 +610,6 @@ synack_in(struct bpf_nf_ctx *ctx)
     if (__sync_val_compare_and_swap(&c->phase, SYNACK_PENDING, SYNACK_CLAIMED)
         != SYNACK_PENDING)
     {
-        return SYNACK_NF_ACCEPT;
-    }
-
-    if (e->ambiguous || e->cookie != cookie) {
-        __sync_lock_test_and_set(&c->phase, SYNACK_PENDING);
         return SYNACK_NF_ACCEPT;
     }
 

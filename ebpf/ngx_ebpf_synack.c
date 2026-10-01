@@ -260,8 +260,7 @@ ngx_ebpf_remove(uint64_t cookie, ngx_uint_t consumed)
         && state.phase != SYNACK_COMPLETE
         && state.has_key
         && bpf_map_lookup_elem(ngx_ebpf_expect_fd, &state.key, &owner) == 0
-        && owner.cookie == cookie
-        && !owner.ambiguous)
+        && owner.cookie == cookie)
     {
         (void) bpf_map_delete_elem(ngx_ebpf_expect_fd, &state.key);
     }

@@ -59,9 +59,7 @@ struct synack_connection {
 
 
 struct synack_expectation {
-    __u64                   cookie;
-    __u32                   ambiguous;
-    __u32                   pad;
+    __u64                   cookie;     /* the owner */
 };
 
 

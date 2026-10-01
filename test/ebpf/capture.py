@@ -24,8 +24,7 @@ class Connection(C.Structure):
 
 
 class Expectation(C.Structure):
-    _fields_ = [("cookie", C.c_uint64),
-                ("ambiguous", C.c_uint32), ("pad", C.c_uint32)]
+    _fields_ = [("cookie", C.c_uint64)]
 
 
 VERSION = 2     # SYNACK_VERSION
@@ -316,17 +315,19 @@ class Collector:
         raw_cookie = int.from_bytes(self.raw[2].getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
         second = self.register(cookie=raw_cookie)
         try:
-            before = self.counter(2)
+            # The second live owner's SYN collides: the first keeps the key.
+            before = self.counter(2)                        # COLLISION
             self.send(outgoing, packet(outgoing, flags=2))
-            conflict = self.get("expect", reply, Expectation)
-            assert conflict.cookie == first.value and conflict.ambiguous == 1
+            assert self.get("expect", reply, Expectation).cookie == first.value
+            assert not self.get("conn", second, Connection).has_key
             assert self.counter(2) > before
-            self.send(reply, packet(reply))
-            assert self.get("capture", first, Record) is None
-            assert self.get("capture", second, Record) is None
-            # Registering either owner again must not erase the tombstone.
+            # A retransmitted SYN changes nothing.
             self.send(outgoing, packet(outgoing, flags=2))
-            assert self.get("expect", reply, Expectation).ambiguous == 1
+            assert self.get("expect", reply, Expectation).cookie == first.value
+            # The matching SYN-ACK is captured for the first owner only.
+            self.send(reply, packet(reply))
+            assert self.get("capture", first, Record, consume=True)
+            assert self.get("capture", second, Record) is None
         finally:
             self.clean(first)
             self.clean(second)
@@ -381,20 +382,20 @@ class Collector:
                 self.clean(c)
 
     def stale_owner_takeover(self):
-        # A key left behind by a registration that no longer exists (here an
-        # ambiguous one, owned by cookie 123) is free: the next owner takes it
-        # over instead of both being blocked as a collision. A key whose owner
-        # is still registered stays a collision (see collisions()).
+        # A key left behind by a registration that no longer exists (owned by
+        # cookie 123, never registered) is free: the next owner takes it over.
+        # A key whose owner is still registered keeps that owner (see
+        # collisions()).
         outgoing = key(src="127.0.0.2", dst="127.0.0.1", sport=40500, dport=40501, ack=0)
         reply = key(src="127.0.0.1", dst="127.0.0.2", sport=40501, dport=40500, ack=101)
-        self.put("expect", reply, Expectation(123, 1))
+        self.put("expect", reply, Expectation(123))
         raw_cookie = int.from_bytes(self.raw[2].getsockopt(socket.SOL_SOCKET, 57, 8), sys.byteorder)
         cookie = self.register(cookie=raw_cookie)
         try:
             before = self.counter(2)
             self.send(outgoing, packet(outgoing, flags=2))
             e = self.get("expect", reply, Expectation)
-            assert e.cookie == cookie.value and e.ambiguous == 0, (e.cookie, e.ambiguous)
+            assert e.cookie == cookie.value, e.cookie
             assert self.counter(2) == before
             self.send(reply, packet(reply))
             assert self.get("capture", cookie, Record)
@@ -452,7 +453,7 @@ def main():
         for name, case in [
             ("ACK of SYN data misses, retransmission retention, alias limit, terminal state",
              c.synack_lifecycle),
-            ("colliding full keys remain ambiguous for both owners", c.collisions),
+            ("a colliding key keeps its first live owner", c.collisions),
             ("full expectation map evicts; ACK arithmetic wraps at 32 bits",
              c.expectation_eviction),
             ("full capture map evicts for a new capture", c.capture_eviction),

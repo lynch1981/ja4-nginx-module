@@ -266,8 +266,10 @@ Other cases:
   A socket never sends one, so the first key is kept and the attempt is counted
   as `SECOND_KEY`.
 - **Collision with a live owner.** A key already owned by another cookie whose
-  registration still exists is marked ambiguous (`COLLISION`). Neither owner
-  matches it, and it stays a tombstone until the LRU map evicts it.
+  registration still exists keeps that first owner (`COLLISION`): a matching
+  SYN-ACK is captured for it, and the second connection misses. Two live
+  connections share a key only with the same tuple and initial sequence
+  number, which only crafted traffic produces.
 - **Owner gone.** A key whose recorded owner has no registration left is taken
   over as if absent.
 - **TCP Fast Open.** Stock nginx never enables it upstream, so a SYN-ACK that
@@ -293,9 +295,8 @@ For a SYN-ACK (SYN and ACK set, RST clear), the program:
 1. Matches the complete key.
 2. Requires the owner's registration and atomically claims it
    (`PENDING → CLAIMED`).
-3. Rechecks that the key is still unambiguous and owned by that cookie.
-4. Stores the headers under the cookie.
-5. Marks the registration `COMPLETE`, removes the keys it owns, and deletes the
+3. Stores the headers under the cookie.
+4. Marks the registration `COMPLETE`, removes the keys it owns, and deletes the
    registration.
 
 A failed store releases the claim (`CAPTURE_FULL`). The capture record then
@@ -306,7 +307,7 @@ SYN-ACK finds no registration.
 stateDiagram-v2
     [*] --> PENDING: nginx registers before connect()
     PENDING --> CLAIMED: synack_in matches a key
-    CLAIMED --> PENDING: store failed / key turned ambiguous
+    CLAIMED --> PENDING: store failed
     CLAIMED --> COMPLETE: headers stored
     COMPLETE --> [*]: synack_in deletes the registration
     PENDING --> [*]: nginx consume or close (MISSED if consumed)
@@ -385,7 +386,7 @@ zero-scale rules. JA4TS has no hashed form, so there is no `_string` variant.
 | Map | Type | Key | Value | Capacity |
 | --- | --- | --- | --- | ---: |
 | `synack_conn` | LRU hash | cookie | `{phase, has_key, key}` | 65,536 |
-| `synack_expect` | LRU hash | 44-byte tuple + ACK | `{cookie, ambiguous}` | 65,536 |
+| `synack_expect` | LRU hash | 44-byte tuple + ACK | `{cookie}` | 65,536 |
 | `synack_capture` | LRU hash | cookie | `{version, length, headers[256]}` | 65,536 |
 | `synack_stats` | array, mmapable | counter index | `u64` | 12 |
 | `synack_scratch` | per-CPU array | 0 | one record, transient | 1 |
@@ -397,7 +398,7 @@ index, so new ones are appended:
 | ---: | --- | --- |
 | 0 | `EXPECT_FULL` | an expectation insert lost a race (LRU: never for lack of room) |
 | 1 | `SECOND_KEY` | a SYN that would need a second key (another sequence number); the first is kept |
-| 2 | `COLLISION` | a key already owned by another live registration |
+| 2 | `COLLISION` | a key already owned by another live registration; the first owner keeps it |
 | 3 | `CAPTURE_FULL` | a capture insert lost a race; the claim is released |
 | 4 | `CAPTURED` | a SYN-ACK stored |
 | 5 | `EXPIRED` | retired: counted sweeper expiries, always 0 now |
@@ -421,7 +422,7 @@ also shows as `MISSED`, because its registration survives.
   come from its own socket's SYN-ACK and is consumed right after the handshake.
   A key whose owner is gone matches nothing and is taken over by the next owner.
 - **No sweep.** What a failure leaves behind (a crashed worker's registrations, a
-  missed SYN-ACK's keys, an ambiguous key) is never looked up again, so the LRU
+  missed SYN-ACK's key) is never looked up again, so the LRU
   maps evict it first when an insert needs room. That is bounded work per
   insert, with no periodic pass in the kernel or a worker.
 - **Past capacity** (more than ~65k connections in flight at once), an insert
@@ -525,7 +526,15 @@ microbenchmark instead.
 7. **Next free priority per instance** instead of a fixed priority. A fixed one
    made a second capture-enabled nginx, and the new master of a binary upgrade,
    fail with `EBUSY`, and the error blamed the kernel version.
-8. **Split nginx side:** the loader (`ngx_ebpf_module.c`, master, process
+8. **First owner wins on a collision.** An earlier design marked a key that two
+   live connections expected as ambiguous, captured for neither, and kept it as
+   a tombstone so neither owner's cleanup could remove it. That took a flag in
+   every expectation, a recheck after the claim, and tombstone rules in both
+   cleanup paths, for a case only crafted traffic produces. Now the first owner
+   keeps the key and the second misses (`COLLISION`, then `MISSED`); at worst
+   one connection gets the other's fingerprint. The expectation value shrank
+   to `{cookie}`.
+9. **Split nginx side:** the loader (`ngx_ebpf_module.c`, master, process
    lifetime) and the per-connection capture (`ngx_ebpf_synack.c`, workers).
 
 ## Limits
@@ -546,9 +555,11 @@ microbenchmark instead.
 - **Unprivileged workers on 6.4** with `kernel.unprivileged_bpf_disabled` set are
   unverified.
 - **Silent eviction past capacity,** counted as described in
-  [Maps and counters](#maps-and-counters). An ambiguous key evicted under
-  pressure could let a later owner of the same tuple and ISN take it over, which
-  is negligible.
+  [Maps and counters](#maps-and-counters).
+- **Collisions are not refused.** If two live connections ever expected the
+  same key (same tuple and initial sequence number, only from crafted
+  traffic), the first owner gets the matching SYN-ACK, even if it was the
+  second's.
 
 ## Testing
 
