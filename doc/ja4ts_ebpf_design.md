@@ -282,8 +282,11 @@ flags byte is the first thing that can decide.
 header and the flags for IPv4 without options and IPv6 without extension
 headers, and those packets are decided at once. It answers "not a SYN-ACK" only
 where the full parse could not yield one either: not TCP, a fragment, other
-flags. IPv4 options, IPv6 extension headers and short reads fall through to
-`synack_parse_packet()`, which is unchanged.
+flags, or too short or malformed for TCP (under 40 bytes, an IPv4 header under
+20 bytes, IPv6 + TCP under 60 bytes). Only IPv4 options and IPv6 extension
+headers, which one read cannot cover, fall through to `synack_parse_packet()`,
+which is unchanged. The IPv4 header-length check is defensive: `ip_rcv()`
+already drops such packets before PREROUTING.
 
 For a SYN-ACK (SYN and ACK set, RST clear), the program:
 

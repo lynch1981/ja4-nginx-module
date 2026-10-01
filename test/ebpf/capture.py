@@ -430,6 +430,11 @@ def main():
         c.capture_case("IPv6 jumbograms rejected", k6, packet(k6, jumbo=True))
         c.capture_case("ESP rejected", k6, packet(k6, next_header=50))
         c.capture_case("short TCP header rejected", k4, packet(k4, tcp_offset=4))
+        # synack_candidate() turns these away before the full parse
+        c.capture_case("truncated IPv4 TCP header rejected", k4, packet(k4)[:36])
+        short6 = bytearray(packet(k6)[:50])
+        short6[4:6] = struct.pack("!H", 10)           # payload length matches
+        c.capture_case("truncated IPv6 TCP header rejected", k6, bytes(short6))
         c.capture_case("inaccessible TCP options rejected", k4, packet(k4, tcp_offset=15))
         c.capture_case("RST SYN-ACK rejected", k4, packet(k4, flags=0x16))
         c.non_synack("IPv4 non-SYN-ACK packets never captured", k4)

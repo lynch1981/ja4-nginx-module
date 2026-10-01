@@ -60,9 +60,10 @@ Each case belongs to the lowest layer that can observe it.
 - **`capture.py`: the collector, driven directly.** It extracts the object
   embedded in the committed skeleton, exactly what nginx ships, loads it with
   test map capacities (1024 registrations and captures, 2048 expectations)
-  and reports 31 TAP points: 30 cases plus the remote namespace setup:
+  and reports 33 TAP points: 32 cases plus the remote namespace setup:
   - crafted packets: payload exclusion, IPv4 options, IPv6 extension limits,
-    fragments, jumbograms, ESP, bad TCP offsets, RST, and non-SYN-ACK flags
+    fragments, jumbograms, ESP, bad TCP offsets, truncated IPv4 and IPv6 TCP
+    headers, RST, and non-SYN-ACK flags
     (ACK, SYN, data, FIN, RST) on a registered key, over IPv4 and IPv6
   - SYN-data ACK misses, retransmitted SYNs keeping their key, terminal state,
     colliding ownership, and ACK wraparound

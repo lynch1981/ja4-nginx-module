@@ -210,12 +210,16 @@ synack_parse_packet(struct sk_buff *skb, struct synack_key *key,
  * synack_in sees every inbound packet, so this looks first: one probe read
  * covers the IP header and the TCP flags byte for the common layouts, IPv4
  * without options and IPv6 without extension headers, and decides those.
- * Returns 0 only where the full parse could not yield a SYN-ACK either; any
- * other layout is a candidate, left to the full parse.
+ * Packets too short or malformed for the full parse are turned away here
+ * too, so only IPv4 options and IPv6 extension headers, which one read
+ * cannot cover, are left to it.  Returns 0 only where the full parse could
+ * not yield a SYN-ACK either.
  */
 
 #define SYNACK_FLAGS_READ_V4        34      /* IPv4 + TCP up to the flags */
 #define SYNACK_FLAGS_READ_V6        54      /* IPv6 + TCP up to the flags */
+#define SYNACK_MIN_TCP_V4           40      /* IPv4 + TCP headers, no options */
+#define SYNACK_MIN_TCP_V6           60      /* IPv6 + TCP headers */
 
 static __always_inline int
 synack_candidate(struct sk_buff *skb)
@@ -228,8 +232,10 @@ synack_candidate(struct sk_buff *skb)
     offset = skb->network_header;
     tail = skb->tail;
 
-    if (offset > tail || tail - offset < SYNACK_FLAGS_READ_V4) {
-        return 1;
+    /* the full parse needs at least an IPv4 and a TCP header */
+
+    if (offset > tail || tail - offset < SYNACK_MIN_TCP_V4) {
+        return 0;
     }
 
     if (tail - offset >= SYNACK_FLAGS_READ_V6) {
@@ -238,7 +244,7 @@ synack_candidate(struct sk_buff *skb)
         }
 
     } else if (bpf_probe_read_kernel(b, SYNACK_FLAGS_READ_V4, head + offset)) {
-        return 1;
+        return 1;                       /* not invalid: let the full parse try */
     }
 
     if (b[0] >> 4 == 4) {
@@ -247,7 +253,11 @@ synack_candidate(struct sk_buff *skb)
             return 0;                   /* not TCP, or a fragment */
         }
 
-        if (b[0] != 0x45) {
+        if (b[0] < 0x45) {
+            return 0;                   /* header shorter than 20 bytes */
+        }
+
+        if (b[0] > 0x45) {
             return 1;                   /* options: the full parse decides */
         }
 
@@ -264,8 +274,8 @@ synack_candidate(struct sk_buff *skb)
                    || next == SYNACK_IPV6_AH;
         }
 
-        if (tail - offset < SYNACK_FLAGS_READ_V6) {
-            return 1;
+        if (tail - offset < SYNACK_MIN_TCP_V6) {
+            return 0;                   /* no room for the TCP header */
         }
 
         flags = b[53];
