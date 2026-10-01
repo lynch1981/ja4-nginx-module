@@ -445,7 +445,7 @@ def test_eviction(binary, tap):
 def test_miss(binary, tap):
     with tap.case("a registered connection whose SYN-ACK was missed is counted at consume"):
         # the instrumented build registers as not pending, so synack_out
-        # records no keys and the SYN-ACK matches nothing
+        # records no key and the SYN-ACK matches nothing
         backend = Backend()
         n = Nginx(binary, True, env={"NGX_SYNACK_TEST_MISS": "1"})
         try:

@@ -20,7 +20,7 @@ from fixture import Loader, Tap, Tuple, namespace, remote_backend, rules, skelet
 
 class Connection(C.Structure):
     _fields_ = [("phase", C.c_uint32),
-                ("count", C.c_uint32), ("keys", Tuple * 1)]
+                ("has_key", C.c_uint32), ("key", Tuple)]
 
 
 class Expectation(C.Structure):
@@ -137,7 +137,7 @@ class Collector:
         cookie = C.c_uint64(cookie or self.serial)
         state = Connection()
         if k is not None:
-            state.keys[0], state.count = k, 1
+            state.key, state.has_key = k, 1
         self.put("conn", cookie, state)
         if k is not None:
             self.put("expect", k, Expectation(cookie.value))
@@ -145,9 +145,8 @@ class Collector:
 
     def clean(self, cookie):
         state = self.get("conn", cookie, Connection)
-        if state:
-            for k in state.keys[:state.count]:
-                self.delete("expect", k)
+        if state and state.has_key:
+            self.delete("expect", state.key)
         self.delete("conn", cookie)
         self.delete("capture", cookie)
 
@@ -207,24 +206,27 @@ class Collector:
             # One key: the wire tuple reversed, ACK S+1.
             self.send(outgoing, packet(outgoing, flags=2))
             state = self.get("conn", cookie, Connection)
-            assert state.count == 1 and bytes(state.keys[0]) == bytes(reply), state.count
+            assert state.has_key and bytes(state.key) == bytes(reply), state.has_key
             # nginx never sends SYN data upstream: a SYN carrying data adds no
             # S+1+N key, and a SYN-ACK acknowledging the data does not match.
             self.send(outgoing, packet(outgoing, flags=2, payload=b"hello"))
-            assert self.get("conn", cookie, Connection).count == 1
+            assert bytes(self.get("conn", cookie, Connection).key) == bytes(reply)
             data_ack = key(src="127.0.0.1", dst="127.0.0.2", sport=40101, dport=40100, ack=106)
             self.send(data_ack, packet(data_ack))
             assert self.get("capture", cookie, Record) is None
-            # A retransmitted SYN keeps the same keys.
+            # A retransmitted SYN keeps the same key, and re-adds it if the
+            # LRU map evicted it.
             self.send(outgoing, packet(outgoing, flags=2))
             newer = self.get("conn", cookie, Connection)
-            assert newer.count == 1 and bytes(newer.keys) == bytes(state.keys)
-            for k in newer.keys:
-                assert self.get("expect", k, Expectation).cookie == cookie.value
+            assert newer.has_key and bytes(newer.key) == bytes(state.key)
+            assert self.get("expect", reply, Expectation).cookie == cookie.value
+            self.delete("expect", reply)
+            self.send(outgoing, packet(outgoing, flags=2))
+            assert self.get("expect", reply, Expectation).cookie == cookie.value
             # A SYN with another sequence number cannot add a second key.
-            previous = self.counter(1)
+            previous = self.counter(1)                      # SECOND_KEY
             self.send(outgoing, packet(outgoing, flags=2, seq=999))
-            assert self.get("conn", cookie, Connection).count == 1
+            assert bytes(self.get("conn", cookie, Connection).key) == bytes(reply)
             assert self.counter(1) > previous
             self.send(reply, packet(reply))
             assert self.get("capture", cookie, Record, consume=True)
@@ -257,15 +259,14 @@ class Collector:
             finally:
                 self.clean(cookie)
 
-    def tcp_case(self, name, address, expected_source, aliases):
+    def tcp_case(self, name, address, expected_source):
         with self.tap.case("production " + name):
             # A missed capture leaves the registration with the one key the
             # SYN added: its wire tuple reversed, across NAT as well.
             with self.tcp(address, hold=True) as cookie:
                 state = self.get("conn", cookie, Connection)
-                assert state.phase == 0 and state.count == aliases, (name, state.count)
-                assert sorted(bytes(k) for k in self.owned(cookie)) == sorted(
-                    bytes(k) for k in state.keys[:state.count]), name
+                assert state.phase == 0 and state.has_key, name
+                assert [bytes(k) for k in self.owned(cookie)] == [bytes(state.key)], name
             # A stored capture deletes the registration and every key it owned.
             with self.tcp(address) as cookie:
                 record = self.get("capture", cookie, Record, consume=True)
@@ -281,13 +282,13 @@ class Collector:
 
     def remote(self):
         with remote_backend():
-            self.tcp_case("remote IPv4", "192.0.2.2", "192.0.2.2", 1)
-            self.tcp_case("remote IPv6", "2001:db8:1::2", "2001:db8:1::2", 1)
-            self.tcp_case("remote IPv4-mapped socket", "::ffff:192.0.2.2", "192.0.2.2", 1)
+            self.tcp_case("remote IPv4", "192.0.2.2", "192.0.2.2")
+            self.tcp_case("remote IPv6", "2001:db8:1::2", "2001:db8:1::2")
+            self.tcp_case("remote IPv4-mapped socket", "::ffff:192.0.2.2", "192.0.2.2")
             with rules("chain out { type filter hook output priority raw; notrack; }\n"
                        "chain pre { type filter hook prerouting priority raw; notrack; }"):
-                self.tcp_case("remote IPv4 untracked", "192.0.2.2", "192.0.2.2", 1)
-                self.tcp_case("remote IPv6 untracked", "2001:db8:1::2", "2001:db8:1::2", 1)
+                self.tcp_case("remote IPv4 untracked", "192.0.2.2", "192.0.2.2")
+                self.tcp_case("remote IPv6 untracked", "2001:db8:1::2", "2001:db8:1::2")
             for name, address, original, out, post in [
                 ("remote DNAT", "198.51.100.9", "192.0.2.2",
                  "ip daddr 198.51.100.9 tcp dport 23456 dnat ip to 192.0.2.2:23456", ""),
@@ -306,7 +307,7 @@ class Collector:
                 if post:
                     body += f"chain post {{ type nat hook postrouting priority srcnat; {post}; }}\n"
                 with rules(body):
-                    self.tcp_case(name, address, original, 1)
+                    self.tcp_case(name, address, original)
 
     def collisions(self):
         outgoing = key(src="127.0.0.2", dst="127.0.0.1", sport=40200, dport=40201, ack=0)
@@ -331,7 +332,7 @@ class Collector:
             self.clean(second)
 
     def expectation_eviction(self):
-        # A full expectation map evicts instead of refusing the SYN's keys.
+        # A full expectation map evicts instead of refusing the SYN's key.
         keys = [key(ack=10000+i) for i in range(2 * CAPACITY["expect"])]
         for k in keys:
             self.put("expect", k, Expectation(123))
@@ -343,7 +344,7 @@ class Collector:
             before = self.counter(0)
             self.send(outgoing, packet(outgoing, flags=2, seq=0xffffffff))
             assert self.counter(0) == before
-            assert self.get("conn", cookie, Connection).count > 0
+            assert self.get("conn", cookie, Connection).has_key
             reply = key(src="127.0.0.1", dst="127.0.0.2", sport=40301, dport=40300, ack=0)
             self.send(reply, packet(reply))
             assert self.get("capture", cookie, Record)

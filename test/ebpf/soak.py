@@ -32,7 +32,7 @@ from fixture import Tap, command, namespace
 from nginx import Maps, resources, wait
 
 
-STATS = ["EXPECT_FULL", "ALIAS_FULL", "COLLISION", "CAPTURE_FULL", "CAPTURED",
+STATS = ["EXPECT_FULL", "SECOND_KEY", "COLLISION", "CAPTURE_FULL", "CAPTURED",
          "EXPIRED", "REGISTER_FAILED", "ALLOC_FAILED", "HANDOFF_ERROR",
          "INVALID_RECORD", "EVICTED", "MISSED"]
 

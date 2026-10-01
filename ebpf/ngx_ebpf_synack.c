@@ -150,7 +150,7 @@ ngx_connection_save_synack(ngx_connection_t *c)
 
             /*
              * The registration is still pending: the SYN-ACK was not
-             * captured.  The *_FULL, ALIAS_FULL and COLLISION counters
+             * captured.  The *_FULL, SECOND_KEY and COLLISION counters
              * explain some misses; the rest took a path the programs cannot
              * see, or are bugs.
              */
@@ -246,7 +246,7 @@ ngx_connection_cleanup_synack(ngx_connection_t *c)
 static ngx_uint_t
 ngx_ebpf_remove(uint64_t cookie, ngx_uint_t consumed)
 {
-    ngx_uint_t                  i, registered;
+    ngx_uint_t                  registered;
     struct synack_connection    state;
     struct synack_expectation   owner;
 
@@ -254,21 +254,16 @@ ngx_ebpf_remove(uint64_t cookie, ngx_uint_t consumed)
                                                 &state)
                  == 0;
 
-    /* a completed capture has already removed the keys it owned in BPF */
+    /* a completed capture has already removed the key it owned in BPF */
 
-    if (registered && state.phase != SYNACK_COMPLETE) {
-        for (i = 0; i < state.count && i < SYNACK_MAX_ALIASES; i++) {
-
-            if (bpf_map_lookup_elem(ngx_ebpf_expect_fd, &state.keys[i],
-                                    &owner)
-                == 0
-                && owner.cookie == cookie
-                && !owner.ambiguous)
-            {
-                (void) bpf_map_delete_elem(ngx_ebpf_expect_fd,
-                                           &state.keys[i]);
-            }
-        }
+    if (registered
+        && state.phase != SYNACK_COMPLETE
+        && state.has_key
+        && bpf_map_lookup_elem(ngx_ebpf_expect_fd, &state.key, &owner) == 0
+        && owner.cookie == cookie
+        && !owner.ambiguous)
+    {
+        (void) bpf_map_delete_elem(ngx_ebpf_expect_fd, &state.key);
     }
 
     if (!consumed) {

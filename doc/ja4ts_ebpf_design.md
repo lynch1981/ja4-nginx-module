@@ -260,9 +260,11 @@ The layout is in `ebpf/ngx_ebpf.h`.
 
 Other cases:
 
-- **Retransmitted SYN.** It re-adds the same keys.
-- **A second key.** A SYN with another sequence number would need a second key;
-  it is skipped and counted as `ALIAS_FULL`.
+- **Retransmitted SYN.** It has the same key, and re-adds it if the LRU map
+  evicted it.
+- **A second key.** A SYN with another sequence number would need a second key.
+  A socket never sends one, so the first key is kept and the attempt is counted
+  as `SECOND_KEY`.
 - **Collision with a live owner.** A key already owned by another cookie whose
   registration still exists is marked ambiguous (`COLLISION`). Neither owner
   matches it, and it stays a tombstone until the LRU map evicts it.
@@ -379,7 +381,7 @@ zero-scale rules. JA4TS has no hashed form, so there is no `_string` variant.
 
 | Map | Type | Key | Value | Capacity |
 | --- | --- | --- | --- | ---: |
-| `synack_conn` | LRU hash | cookie | `{phase, count, keys[1]}` | 65,536 |
+| `synack_conn` | LRU hash | cookie | `{phase, has_key, key}` | 65,536 |
 | `synack_expect` | LRU hash | 44-byte tuple + ACK | `{cookie, ambiguous}` | 65,536 |
 | `synack_capture` | LRU hash | cookie | `{version, length, headers[256]}` | 65,536 |
 | `synack_stats` | array, mmapable | counter index | `u64` | 12 |
@@ -391,7 +393,7 @@ index, so new ones are appended:
 | # | Counter | Counted when |
 | ---: | --- | --- |
 | 0 | `EXPECT_FULL` | an expectation insert lost a race (LRU: never for lack of room) |
-| 1 | `ALIAS_FULL` | a second distinct key for one connection |
+| 1 | `SECOND_KEY` | a SYN that would need a second key (another sequence number); the first is kept |
 | 2 | `COLLISION` | a key already owned by another live registration |
 | 3 | `CAPTURE_FULL` | a capture insert lost a race; the claim is released |
 | 4 | `CAPTURED` | a SYN-ACK stored |
@@ -403,7 +405,7 @@ index, so new ones are appended:
 | 10 | `EVICTED` | at consume: neither registration nor capture left |
 | 11 | `MISSED` | at consume: registration still pending, no capture |
 
-`MISSED` should roughly equal `EXPECT_FULL + CAPTURE_FULL + ALIAS_FULL +
+`MISSED` should roughly equal `EXPECT_FULL + CAPTURE_FULL + SECOND_KEY +
 COLLISION`. Unexplained misses mean the traffic took a path the programs cannot
 see (see [Limits](#limits)), or a bug. An expectation key evicted under pressure
 also shows as `MISSED`, because its registration survives.
@@ -479,7 +481,10 @@ microbenchmark instead.
    fingerprinting the host's own stack through its own NAT says little, and the
    second key cost an extra map insert and four CO-RE reads on every new
    connection (`synack_out` per registered SYN, median 1,487 → 925 ns on the
-   test VM). It also halved `synack_expect` to 65,536 entries.
+   test VM). It also halved `synack_expect` to 65,536 entries, and the
+   registration now holds a single key (`{phase, has_key, key}`); the per-key
+   loops and `SYNACK_MAX_ALIASES` are gone, and the counter at index 1 is
+   `SECOND_KEY` (formerly `ALIAS_FULL`).
 3. **A committed skeleton** means building nginx needs libbpf but no BPF
    toolchain. `gen-skel.sh` is byte-identical wherever it runs: it compiles a
    copy of the inputs by relative paths in a fixed-length directory, because

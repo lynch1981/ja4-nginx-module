@@ -17,9 +17,7 @@
 
 #define SYNACK_VERSION          2
 #define SYNACK_MAX_HEADERS      256
-#define SYNACK_MAX_ALIASES      1       /* the wire tuple */
-#define SYNACK_CONNECTIONS      65536
-#define SYNACK_EXPECTATIONS     (SYNACK_MAX_ALIASES * SYNACK_CONNECTIONS)
+#define SYNACK_CONNECTIONS      65536   /* and one expectation key each */
 
 
 /*
@@ -55,8 +53,8 @@ enum synack_phase {
 
 struct synack_connection {
     __u32                   phase;
-    __u32                   count;
-    struct synack_key       keys[SYNACK_MAX_ALIASES];
+    __u32                   has_key;
+    struct synack_key       key;        /* the SYN's wire tuple, reversed */
 };
 
 
@@ -82,7 +80,7 @@ struct synack_record {
 
 enum synack_stat {
     SYNACK_STAT_EXPECT_FULL = 0,
-    SYNACK_STAT_ALIAS_FULL,
+    SYNACK_STAT_SECOND_KEY,             /* a SYN wanting a different key */
     SYNACK_STAT_COLLISION,
     SYNACK_STAT_CAPTURE_FULL,
     SYNACK_STAT_CAPTURED,

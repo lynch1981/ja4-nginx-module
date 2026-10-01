@@ -317,7 +317,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, SYNACK_EXPECTATIONS);
+    __uint(max_entries, SYNACK_CONNECTIONS);
     __type(key, struct synack_key);
     __type(value, struct synack_expectation);
 } synack_expect SEC(".maps");
@@ -393,7 +393,6 @@ static __always_inline void
 synack_add_expectation(struct synack_key *key, __u64 cookie,
     struct synack_connection *c)
 {
-    __u32                       i, slot;
     struct synack_expectation  *e, value = {
         .cookie = cookie
     };
@@ -402,19 +401,14 @@ synack_add_expectation(struct synack_key *key, __u64 cookie,
         return;
     }
 
-    slot = SYNACK_MAX_ALIASES;
+    /*
+     * A retransmitted SYN has the same key, and goes on to re-add it if the
+     * LRU map evicted it.  A SYN with another sequence number would need a
+     * second key; a socket never sends one, so keep the first.
+     */
 
-    for (i = 0; i < SYNACK_MAX_ALIASES; i++) {
-        if (i < c->count
-            && __builtin_memcmp(&c->keys[i], key, sizeof(*key)) == 0)
-        {
-            slot = i;
-            break;
-        }
-    }
-
-    if (slot == SYNACK_MAX_ALIASES && c->count >= SYNACK_MAX_ALIASES) {
-        synack_count(SYNACK_STAT_ALIAS_FULL);
+    if (c->has_key && __builtin_memcmp(&c->key, key, sizeof(*key)) != 0) {
+        synack_count(SYNACK_STAT_SECOND_KEY);
         return;
     }
 
@@ -453,13 +447,9 @@ synack_add_expectation(struct synack_key *key, __u64 cookie,
         __sync_lock_test_and_set(&e->ambiguous, 0);
     }
 
-    if (slot == SYNACK_MAX_ALIASES) {
-        slot = c->count;
-
-        if (slot < SYNACK_MAX_ALIASES) {
-            c->keys[slot] = *key;
-            c->count = slot + 1;
-        }
+    if (!c->has_key) {
+        c->key = *key;
+        c->has_key = 1;
     }
 
     /* a concurrent synack_in may have completed while the key was added */
@@ -555,7 +545,7 @@ SEC("netfilter")
 int
 synack_in(struct bpf_nf_ctx *ctx)
 {
-    int                          i, flags;
+    int                          flags;
     __u32                        zero, length, seq;
     __u64                        cookie;
     struct synack_key            key = {};
@@ -629,10 +619,8 @@ synack_in(struct bpf_nf_ctx *ctx)
 
     __sync_lock_test_and_set(&c->phase, SYNACK_COMPLETE);
 
-    for (i = 0; i < SYNACK_MAX_ALIASES; i++) {
-        if (i < c->count) {
-            synack_remove_owned(&c->keys[i], cookie);
-        }
+    if (c->has_key) {
+        synack_remove_owned(&c->key, cookie);
     }
 
     /* the capture now carries the result; c must not be used after this */
