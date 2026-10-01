@@ -10,6 +10,75 @@ records the alternatives that were measured and rejected. For configuration see
 the [README](../README.md#ja4ts). For test commands see
 [test/ebpf/README.md](../test/ebpf/README.md).
 
+## Big picture
+
+Where the two programs sit in Netfilter, in the style of the Netfilter hacking
+HOWTO. nginx's SYN leaves through `[5]` and `[4]`, and the upstream's SYN-ACK
+comes back through `[1]` and `[2]`. `synack_out` is the last hook to see the
+SYN, after SNAT; `synack_in` is the first to see the SYN-ACK, before defrag,
+conntrack and NAT. What ties them to nginx is the registration: before
+`connect()`, the worker writes the socket cookie into `synack_conn`.
+`synack_out` reads it to recognize nginx's SYN, and `synack_in` claims it, and
+deletes it once the SYN-ACK is stored.
+
+```
+            SYN-ACK in                           SYN out
+                |                                   ^
+                v                                   |
+                --->[1]--->[ROUTE]--->[3]--->[4]--->+
+                     *        |               ^ ******************
+           synack_in *        |               |           read   * synack_out
+        (first hook) *        |            [ROUTE]               v (last hook)
+                     *        |               ^         +-----------------+
+                     *        v               |         |   synack_conn   |
+                     *       [2]             [5]        | cookie: PENDING |
+                     *        |               ^         +-----------------+
+                     *        |               |             ^         ^
+                     *        v               |             |         *
+                     *   +------------------------+         |         *
+                     *   |      nginx worker      |---------+         *
+                     *   +------------------------+ register,         *
+                     *                              before connect()  *
+                     *                                                *
+                     **************************************************
+                       claim it; delete it once the SYN-ACK is stored
+
+  [1] PREROUTING  [2] LOCAL_IN  [3] FORWARD  [4] POSTROUTING  [5] LOCAL_OUT
+  ---> packet path    ***> BPF program access to the map
+```
+
+One upstream connection, step by step:
+
+```
+  nginx worker                   BPF maps                  BPF programs / wire
+  ------------                   --------                  -------------------
+1 register the socket cookie --> synack_conn
+  (before connect)               cookie -> PENDING
+
+2 connect() sends SYN, seq S ----------------------------> [4] synack_out
+                                 synack_conn  -----------> registered and
+                                                           PENDING?
+                                 synack_expect <---------- yes: add 2 keys
+                                 (wire + socket tuple,
+                                  ACK S+1) -> cookie
+
+3                                                          [1] synack_in
+                                                           <-- SYN-ACK arrives
+                                 synack_expect ----------> key -> cookie
+                                 synack_conn  <----------- claim, then delete
+                                 synack_capture <--------- store the headers
+
+4 handshake done: consume <----- synack_capture
+  (lookup-and-delete)
+
+5 $upstream_ja4ts = JA4T format of the headers
+```
+
+Everything else in the namespace passes the hooks cheaply: outbound packets
+after a socket field read or two, inbound ones after one short header read
+(see [Performance](#performance)). The sections below follow the same steps in
+detail.
+
 ## Goals and non-goals
 
 Goals:
