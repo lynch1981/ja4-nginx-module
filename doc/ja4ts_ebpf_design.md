@@ -324,7 +324,7 @@ The record is `{version, length, headers[256]}` and is zero-filled.
   representation is accepted.
 
 Changes made earlier by XDP, TC, local OUTPUT or another namespace cannot be
-undone.
+undone (see [Limits](#limits)).
 
 ### Consume and close
 
@@ -546,9 +546,22 @@ microbenchmark instead.
 - **Same-namespace NAT.** An upstream in nginx's own network namespace reached
   through OUTPUT DNAT, REDIRECT or SNAT is not captured; its reply comes back
   already un-NATed. Without NAT, local upstreams are captured.
-- **Early rewrites.** XDP, TC, OUTPUT and other-namespace rewrites made before
-  early PREROUTING cannot be undone. Arbitrary TCP sequence rewriting is not
-  supported.
+- **XDP and TC mangling is out of scope.** XDP and TC ingress run before
+  PREROUTING, and TC egress after POSTROUTING, so the programs cannot see past
+  them:
+  - **Bytes inside the SYN-ACK** rewritten on ingress (MSS clamping, TCP option
+    or window rewriting) are captured as rewritten: the fingerprint describes
+    the mangled packet, not what the server sent.
+  - **Asymmetric address or port rewriting** (decapsulation, DSR, a one-way
+    translation) leaves the SYN-ACK unmatched, so it is not captured
+    (`MISSED`).
+  - **Symmetric BPF NAT** works, e.g. Cilium's BPF masquerading, which
+    rewrites on TC egress and reverses on ingress. The key is taken at
+    POSTROUTING, before TC egress, and the reply is reversed before
+    PREROUTING, so it arrives in the same form.
+- **Other early rewrites.** Rewrites by local OUTPUT or another namespace before
+  early PREROUTING cannot be undone either. Arbitrary TCP sequence rewriting is
+  not supported.
 - **Out of scope:** stream proxying, TCP Fast Open on upstream connections, and
   retransmission timing or RST suffixes.
 - **64 instances.** At most 64 capture-enabled processes per network namespace.

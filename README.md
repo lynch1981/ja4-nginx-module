@@ -187,6 +187,11 @@ Known limitations:
 - Only IP/TCP headers in the linear part of the socket buffer are read. Drivers
   that leave the TCP header in page fragments at PREROUTING produce no capture
   (the request still succeeds with an empty value). Loopback and veth are linear.
+- XDP and TC mangling is out of scope. A SYN-ACK whose bytes are rewritten on
+  ingress before netfilter (MSS clamping, option or window rewriting) is
+  fingerprinted as rewritten, and asymmetric address rewriting (decapsulation,
+  DSR) prevents capture. Symmetric BPF NAT, such as Cilium's BPF masquerading,
+  works.
 - Unprivileged workers are verified on Linux 6.8. On 6.4, kernels with
   `kernel.unprivileged_bpf_disabled` set may refuse map access from non-root
   workers; this is unverified.
