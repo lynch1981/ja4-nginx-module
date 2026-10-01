@@ -16,35 +16,29 @@ Where the two programs sit in Netfilter, in the style of the Netfilter hacking
 HOWTO. nginx's SYN leaves through `[5]` and `[4]`, and the upstream's SYN-ACK
 comes back through `[1]` and `[2]`. `synack_out` is the last hook to see the
 SYN, after SNAT; `synack_in` is the first to see the SYN-ACK, before defrag,
-conntrack and NAT. What ties them to nginx is the registration: before
-`connect()`, the worker writes the socket cookie into `synack_conn`.
-`synack_out` reads it to recognize nginx's SYN, and `synack_in` claims it, and
-deletes it once the SYN-ACK is stored.
+conntrack and NAT. How they and the nginx worker meet through the maps is shown
+step by step below.
 
 ```
-            SYN-ACK in                           SYN out
+            SYN-ACK in                          SYN out
                 |                                   ^
                 v                                   |
                 --->[1]--->[ROUTE]--->[3]--->[4]--->+
-                     *        |               ^ ******************
-           synack_in *        |               |           read   * synack_out
-        (first hook) *        |            [ROUTE]               v (last hook)
-                     *        |               ^         +-----------------+
-                     *        v               |         |   synack_conn   |
-                     *       [2]             [5]        | cookie: PENDING |
-                     *        |               ^         +-----------------+
-                     *        |               |             ^         ^
-                     *        v               |             |         *
-                     *   +------------------------+         |         *
-                     *   |      nginx worker      |---------+         *
-                     *   +------------------------+ register,         *
-                     *                              before connect()  *
-                     *                                                *
-                     **************************************************
-                       claim it; delete it once the SYN-ACK is stored
+                     *        |               ^ * synack_out
+                 synack_in    |               |   last hook
+                first hook    |            [ROUTE] INT_MAX - 1
+                INT_MIN + 1   |               ^
+                              v               |
+                             [2]             [5]
+                              |               ^
+                              |               |
+                              v               |
+                      +-------------------------------+
+                      |          nginx worker         |
+                      +-------------------------------+
 
   [1] PREROUTING  [2] LOCAL_IN  [3] FORWARD  [4] POSTROUTING  [5] LOCAL_OUT
-  ---> packet path    ***> BPF program access to the map
+  * where a BPF program is attached
 ```
 
 One upstream connection, step by step:
