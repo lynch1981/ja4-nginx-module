@@ -188,7 +188,7 @@ sequenceDiagram
     I->>E: lookup tuple + ACK → cookie
     I->>C: owner registered? claim PENDING → CLAIMED
     I->>R: store headers under cookie
-    I->>E: remove the keys it owns
+    I->>E: remove its key
     I->>C: COMPLETE, then delete
     W->>W: TCP_INFO: established
     W->>R: lookup-and-delete: headers
@@ -296,12 +296,13 @@ For a SYN-ACK (SYN and ACK set, RST clear), the program:
 2. Requires the owner's registration and atomically claims it
    (`PENDING → CLAIMED`).
 3. Stores the headers under the cookie.
-4. Marks the registration `COMPLETE`, removes the keys it owns, and deletes the
+4. Marks the registration `COMPLETE`, removes the key it owns, and deletes the
    registration.
 
-A failed store releases the claim (`CAPTURE_FULL`). The capture record then
-replaces the registration, and nothing can recreate it: a late or duplicate
-SYN-ACK finds no registration.
+If the store fails, the claim is released (`CAPTURE_FULL`) and a retransmitted
+SYN-ACK can try again. If it succeeds, the capture record replaces the
+registration and nothing can recreate it: a late or duplicate SYN-ACK finds no
+registration.
 
 ```mermaid
 stateDiagram-v2
@@ -346,7 +347,7 @@ The first call that finds the handshake done (`TCP_INFO`: `ESTABLISHED` or
 `CLOSE_WAIT`) makes the one consume attempt:
 
 1. `lookup-and-delete` on the capture.
-2. `lookup-and-delete` on the registration, with the owned keys removed if the
+2. `lookup-and-delete` on the registration, with its key removed if the
    registration is still pending.
 3. It classifies the result:
 
@@ -461,10 +462,15 @@ timing included. On hardware with a TSC or kvm-clock expect them to be lower.
 
 | Path | Cost |
 | --- | --- |
-| `synack_out`, any packet not from a registered connecting socket | ~150–160 ns: two field reads |
-| `synack_in`, any inbound packet that is not a SYN-ACK | ~180 ns: one probe read (IPv4 226 → 182 ns, IPv6 236 → 183 ns after `synack_candidate()`) |
-| A new upstream connection, all runs of both programs | ~6–7 µs |
-| A new upstream connection, nginx syscalls | about five (`SO_COOKIE`, register, `TCP_INFO`, two lookup-and-deletes) |
+| `synack_out`, a packet from any socket that is not a registered, connecting one | ~150–180 ns: two field reads |
+| `synack_out`, a registered socket's SYN | ~0.9 µs: header parse and one key insert |
+| `synack_in`, an inbound packet that is not a SYN-ACK | ~180–210 ns: one probe read |
+| BPF per request, keepalive upstream | ~1.2 µs (about 3 + 3 program runs) |
+| BPF per request, new upstream connection | ~5.8 µs (about 8 + 6 runs, including the capture) |
+| nginx syscalls per new connection | about five (`SO_COOKIE`, register, `TCP_INFO`, two lookup-and-deletes) |
+
+The per-request rows count every packet of the request, the client side
+included, as `bench.py` measures them.
 
 On this VM, running any program at all costs about 150 ns, so both hooks are now
 close to that floor for traffic that is not ours. `bench.py` reports on/off
@@ -570,7 +576,7 @@ The suites are described in [test/ebpf/README.md](../test/ebpf/README.md):
 | `capture.py` | The production object driven directly: crafted packets, map states, eviction, ownership, real TCP through NAT. It is also the cross-kernel CO-RE check. |
 | `nginx.py` | nginx lifecycle: handoff, the eviction and miss counters, reload, several instances, binary upgrade, resource release. |
 | `soak.py` | Correctness under load, packet loss and duplication. Every fingerprint must land on its own response, and `EVICTED` and `MISSED` must stay 0. |
-| `ja4ts-*.t` | Directive parsing and variable behavior through nginx, including NAT and IPv6. |
+| `ja4ts-*.t` | Directive parsing and variable behavior through nginx, including IPv6, and NAT to upstreams in nginx's own namespace pinned as not captured. |
 | `bench.py` | The overhead report. |
 
 CI (`.github/workflows/test-ebpf.yaml`) runs these jobs:
