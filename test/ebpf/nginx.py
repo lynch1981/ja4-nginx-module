@@ -202,7 +202,7 @@ http {{
             self.maps = Maps(rows)
             assert self.maps.rows["conn"]["max_entries"] == 65536
             assert self.maps.rows["capture"]["max_entries"] == 65536
-            assert self.maps.rows["expect"]["max_entries"] == 131072
+            assert self.maps.rows["expect"]["max_entries"] == 65536
         else:
             assert not rows
         self.map_ids = set(rows)

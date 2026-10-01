@@ -17,7 +17,7 @@
 
 #define SYNACK_VERSION          2
 #define SYNACK_MAX_HEADERS      256
-#define SYNACK_MAX_ALIASES      2       /* wire and socket tuples */
+#define SYNACK_MAX_ALIASES      1       /* the wire tuple */
 #define SYNACK_CONNECTIONS      65536
 #define SYNACK_EXPECTATIONS     (SYNACK_MAX_ALIASES * SYNACK_CONNECTIONS)
 

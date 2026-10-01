@@ -1,10 +1,14 @@
 # vi:filetype=perl
 # JA4TS across network paths: the fingerprint must always be that of the
-# server that sent the SYN-ACK, whatever happens to the packet between the
-# upstream and nginx's socket.
+# server that sent the SYN-ACK, and a path the capture does not support must
+# leave it empty without disturbing the request.
 #
-# NAT on the nginx host changes the addresses and ports the SYN-ACK carries,
-# so the capture cannot assume they match what nginx connected to. `--- nat`
+# Every upstream here is in nginx's own network namespace (loopback). The
+# capture keys a SYN-ACK by the SYN's wire tuple, after NAT. A reply from
+# another host or namespace arrives in that form; it is covered across
+# DNAT/SNAT by test/ebpf/capture.py. A reply that loops back inside this
+# namespace is un-NATed on its way out, so the NAT cases below (TESTs 2-10)
+# are deliberately not captured: such local backends say little. `--- nat`
 # holds raw nft rules for the nat output (DNAT/REDIRECT) or postrouting
 # (SNAT) hook, with $TEST_NGINX_* expanded:
 #
@@ -71,7 +75,7 @@ X-JA4TS: 8192_2-4-8-1-3_1440_7
 
 
 
-=== TEST 2: DNAT to another port
+=== TEST 2: DNAT to another port: not captured
 # nginx connects to VIRT; the SYN-ACK comes from UP1.
 --- synack
 up1: window=8192 mss=1460 wscale=7
@@ -95,13 +99,13 @@ GET /t
 up1
 --- response_headers eval
 "X-Upstream: 127.0.0.1:$ENV{TEST_NGINX_VIRT_PORT}
-X-JA4TS: 8192_2-4-8-1-3_1460_7"
+!X-JA4TS"
 --- no_error_log
 [error]
 
 
 
-=== TEST 3: DNAT to another address
+=== TEST 3: DNAT to another address: not captured
 # up1 only listens on 127.0.0.1; nginx connects to 127.0.0.2.
 --- synack
 up1: window=8192 mss=1460 wscale=7
@@ -123,13 +127,13 @@ GET /t
 --- response_body
 up1
 --- response_headers
-X-JA4TS: 8192_2-4-8-1-3_1460_7
+!X-JA4TS
 --- no_error_log
 [error]
 
 
 
-=== TEST 4: DNAT from a non-local address and port
+=== TEST 4: DNAT from a non-local address and port: not captured
 # 192.0.2.10 is reached through the fixture's deterministic dummy route.
 --- synack
 up1: window=8192 mss=1460 wscale=7
@@ -152,13 +156,13 @@ GET /t
 --- response_body
 up1
 --- response_headers
-X-JA4TS: 8192_2-4-8-1-3_1460_7
+!X-JA4TS
 --- no_error_log
 [error]
 
 
 
-=== TEST 5: DNAT onto another configured upstream's port
+=== TEST 5: DNAT onto another configured upstream's port: not captured
 # nginx believes it talks to up2, but up1 answers: the fingerprint must be
 # that of the server that sent the SYN-ACK.
 --- synack
@@ -186,13 +190,13 @@ GET /t
 --- response_body
 up1
 --- response_headers
-X-JA4TS: 8192_2-4-8-1-3_1460_7
+!X-JA4TS
 --- no_error_log
 [error]
 
 
 
-=== TEST 6: REDIRECT to a local port
+=== TEST 6: REDIRECT to a local port: not captured
 --- synack
 up1: window=8192 mss=1460 wscale=7
 --- nat
@@ -213,13 +217,13 @@ GET /t
 --- response_body
 up1
 --- response_headers
-X-JA4TS: 8192_2-4-8-1-3_1460_7
+!X-JA4TS
 --- no_error_log
 [error]
 
 
 
-=== TEST 7: SNAT of nginx's source address and port
+=== TEST 7: SNAT of nginx's source address and port: not captured
 # nginx binds 127.0.0.3; the upstream sees 127.0.0.4:40000-40999 and sends
 # the SYN-ACK there.
 --- synack
@@ -243,13 +247,13 @@ GET /t
 --- response_body
 127.0.0.4
 --- response_headers
-X-JA4TS: 8192_2-4-8-1-3_1460_7
+!X-JA4TS
 --- no_error_log
 [error]
 
 
 
-=== TEST 8: DNAT and SNAT on the same connection
+=== TEST 8: DNAT and SNAT on the same connection: not captured
 --- synack
 up1: window=8192 mss=1460 wscale=7
 --- nat
@@ -272,13 +276,13 @@ GET /t
 --- response_body
 127.0.0.4
 --- response_headers
-X-JA4TS: 8192_2-4-8-1-3_1460_7
+!X-JA4TS
 --- no_error_log
 [error]
 
 
 
-=== TEST 9: IPv6 DNAT to another port
+=== TEST 9: IPv6 DNAT to another port: not captured
 --- synack
 up1: window=8192 mss=1440 wscale=7
 --- nat
@@ -299,13 +303,13 @@ GET /t
 --- response_body
 up1
 --- response_headers
-X-JA4TS: 8192_2-4-8-1-3_1440_7
+!X-JA4TS
 --- no_error_log
 [error]
 
 
 
-=== TEST 10: NATed and direct connections in turn do not mix
+=== TEST 10: NATed connections stay uncaptured, direct ones are captured
 # /nat reaches up1 through DNAT; /direct reaches up2 unchanged.
 --- synack
 up1: window=8192 mss=1460 wscale=7
@@ -337,9 +341,9 @@ output: ip daddr 127.0.0.1 tcp dport $TEST_NGINX_VIRT_PORT dnat ip to 127.0.0.1:
 --- response_body eval
 ["up1\n", "up2\n", "up1\n", "up2\n"]
 --- response_headers eval
-["X-JA4TS: 8192_2-4-8-1-3_1460_7",
+["!X-JA4TS",
  "X-JA4TS: 65535_2-4-8-1-3_1400_3",
- "X-JA4TS: 8192_2-4-8-1-3_1460_7",
+ "!X-JA4TS",
  "X-JA4TS: 65535_2-4-8-1-3_1400_3"]
 --- no_error_log
 [error]

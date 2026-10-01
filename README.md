@@ -168,7 +168,9 @@ empty result. TLS is optional.
 
 Keepalive reuse retains the socket's original capture policy. Off requests always
 see empty values; turning capture on cannot recover a handshake that was never
-captured. IPv4, IPv6 and conventional DNAT/SNAT are supported. UDP, Unix sockets
+captured. IPv4, IPv6 and conventional DNAT/SNAT are supported for upstreams on
+other hosts or in other network namespaces; an upstream in nginx's own
+namespace reached through NAT (e.g. REDIRECT) is not captured. UDP, Unix sockets
 and QUIC are excluded. Upstream connections do not use TCP Fast Open (stock nginx
 never enables it), so a SYN-ACK that acknowledges SYN data is not matched.
 Original bytes are those observed at early PREROUTING, before later hook rewrites.

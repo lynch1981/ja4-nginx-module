@@ -3,11 +3,14 @@
 /*
  * Upstream SYN-ACK capture.
  *
- * synack_out (POSTROUTING) sees each SYN of a registered socket and records
- * the SYN-ACK it expects, acknowledging S + 1, under two keys: the
- * on-the-wire tuple and the socket's original tuple, so capture works across
- * DNAT/SNAT.  nginx does not use TCP Fast Open upstream, so a SYN-ACK that
- * acknowledges SYN data is not expected.  synack_in (early
+ * synack_out (POSTROUTING, the last hook, after SNAT and OUTPUT DNAT) sees
+ * each SYN of a registered socket and records the SYN-ACK it expects: the
+ * SYN's wire tuple reversed, acknowledging S + 1.  synack_in runs first in
+ * PREROUTING, before conntrack undoes NAT, so a reply from another host or
+ * namespace arrives in exactly that form, across DNAT/SNAT.  A reply that
+ * loops back inside this namespace is un-NATed on its way out and does not
+ * match; such local backends are not captured.  nginx does not use TCP Fast
+ * Open upstream, so a SYN-ACK that acknowledges SYN data is not expected.  synack_in (early
  * PREROUTING) matches incoming SYN-ACKs against those keys and stores the
  * original IP/TCP headers for nginx to consume by socket cookie.
  */
@@ -473,10 +476,10 @@ synack_out(struct bpf_nf_ctx *ctx)
 {
     int                          flags;
     __u8                         state;
-    __u32                        length, seq, local, remote;
+    __u32                        length, seq;
     __u64                        cookie;
     struct sock                 *sk;
-    struct synack_key            packet = {}, wire = {}, original = {};
+    struct synack_key            packet = {}, wire = {};
     struct synack_connection    *c;
 
     /*
@@ -532,7 +535,7 @@ synack_out(struct bpf_nf_ctx *ctx)
 
     /* a retransmitted SYN re-adds the same keys */
 
-    /* the SYN-ACK as it will arrive: the SYN reversed, acknowledging it */
+    /* the SYN-ACK as it will arrive: the wire SYN reversed, acknowledging it */
 
     wire.family = packet.family;
     wire.protocol = IPPROTO_TCP;
@@ -542,26 +545,7 @@ synack_out(struct bpf_nf_ctx *ctx)
     wire.dport = packet.sport;
     wire.ack = bpf_htonl(bpf_ntohl(seq) + 1);
 
-    /* the same SYN-ACK in terms of the socket, before any NAT */
-
-    original = wire;
-
-    if (packet.family == SYNACK_AF_INET) {
-        local = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
-        remote = BPF_CORE_READ(sk, __sk_common.skc_daddr);
-        __builtin_memcpy(original.src, &remote, 4);
-        __builtin_memcpy(original.dst, &local, 4);
-
-    } else {
-        BPF_CORE_READ_INTO(&original.src, sk, __sk_common.skc_v6_daddr);
-        BPF_CORE_READ_INTO(&original.dst, sk, __sk_common.skc_v6_rcv_saddr);
-    }
-
-    original.sport = BPF_CORE_READ(sk, __sk_common.skc_dport);
-    original.dport = bpf_htons(BPF_CORE_READ(sk, __sk_common.skc_num));
-
     synack_add_expectation(&wire, cookie, c);
-    synack_add_expectation(&original, cookie, c);
 
     return SYNACK_NF_ACCEPT;
 }

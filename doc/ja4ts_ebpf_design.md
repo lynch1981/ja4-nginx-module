@@ -58,8 +58,8 @@ One upstream connection, step by step:
 2 connect() sends SYN, seq S ----------------------------> [4] synack_out
                                  synack_conn  -----------> registered and
                                                            PENDING?
-                                 synack_expect <---------- yes: add 2 keys
-                                 (wire + socket tuple,
+                                 synack_expect <---------- yes: add the key
+                                 (wire tuple reversed,
                                   ACK S+1) -> cookie
 
 3                                                          [1] synack_in
@@ -85,7 +85,8 @@ Goals:
 
 - Capture the SYN-ACK of every upstream TCP connection that has capture enabled,
   as its IP/TCP headers were observed at early PREROUTING.
-- Work across conventional DNAT/SNAT, for IPv4, IPv6 and IPv4-mapped sockets.
+- Work across conventional DNAT/SNAT to upstreams in other hosts or network
+  namespaces, for IPv4, IPv6 and IPv4-mapped sockets.
 - Stay out of the way:
   - Capture is optional metadata. A failure never fails proxied traffic.
   - The per-packet cost for everything else in the network namespace is close
@@ -181,8 +182,7 @@ sequenceDiagram
     W->>U: connect() sends SYN, seq S
     Note over O: early exits: socket not SYN_SENT/CLOSE, or no cookie
     O->>C: lookup cookie: PENDING
-    O->>E: add wire tuple, ACK S+1 → cookie
-    O->>E: add socket tuple, ACK S+1 → cookie
+    O->>E: add wire tuple reversed, ACK S+1 → cookie
     U->>I: SYN-ACK
     Note over I: synack_candidate(): one read, flags decide
     I->>E: lookup tuple + ACK → cookie
@@ -232,17 +232,18 @@ Then the program checks, in order:
 2. It parses the headers.
 3. The SYN flag must be set with ACK and RST clear.
 
-For sequence number S it records up to two expectation keys, each owned by the
-cookie:
+For sequence number S it records one expectation key, owned by the cookie: the
+SYN's wire tuple reversed, acknowledging S + 1. `synack_out` is the last hook,
+so the wire tuple is after SNAT and OUTPUT DNAT, and `synack_in` is the first,
+before conntrack undoes NAT. A reply from another host or namespace therefore
+arrives in exactly that form, across DNAT/SNAT. The key comes from the packet,
+so IPv4-mapped sockets need nothing special. ACK arithmetic wraps modulo 2^32.
 
-| Key | ACK |
-| --- | --- |
-| The outgoing packet's tuple, reversed (after SNAT) | S + 1 |
-| The socket's own tuple, reversed (before NAT) | S + 1 |
-
-The packet key matches replies before reverse NAT. The socket key matches
-same-namespace loopback replies after reverse NAT in OUTPUT. IPv4-mapped sockets
-normalize to the IPv4 representation, and ACK arithmetic wraps modulo 2^32.
+A reply that loops back inside nginx's own namespace after OUTPUT DNAT,
+REDIRECT or SNAT is different: conntrack un-NATs it on its way out, before it
+reaches PREROUTING, so it carries the socket's pre-NAT tuple and does not
+match. Those local backends are deliberately not captured (see
+[Decisions](#decisions-and-rejected-alternatives)).
 
 Each key is 44 bytes, and every unused byte is zero, so keys compare as plain
 memory:
@@ -260,8 +261,8 @@ The layout is in `ebpf/ngx_ebpf.h`.
 Other cases:
 
 - **Retransmitted SYN.** It re-adds the same keys.
-- **More aliases.** A third distinct alias, e.g. from a SYN with another sequence
-  number, is skipped and counted as `ALIAS_FULL`.
+- **A second key.** A SYN with another sequence number would need a second key;
+  it is skipped and counted as `ALIAS_FULL`.
 - **Collision with a live owner.** A key already owned by another cookie whose
   registration still exists is marked ambiguous (`COLLISION`). Neither owner
   matches it, and it stays a tombstone until the LRU map evicts it.
@@ -378,8 +379,8 @@ zero-scale rules. JA4TS has no hashed form, so there is no `_string` variant.
 
 | Map | Type | Key | Value | Capacity |
 | --- | --- | --- | --- | ---: |
-| `synack_conn` | LRU hash | cookie | `{phase, count, keys[2]}` | 65,536 |
-| `synack_expect` | LRU hash | 44-byte tuple + ACK | `{cookie, ambiguous}` | 131,072 |
+| `synack_conn` | LRU hash | cookie | `{phase, count, keys[1]}` | 65,536 |
+| `synack_expect` | LRU hash | 44-byte tuple + ACK | `{cookie, ambiguous}` | 65,536 |
 | `synack_capture` | LRU hash | cookie | `{version, length, headers[256]}` | 65,536 |
 | `synack_stats` | array, mmapable | counter index | `u64` | 12 |
 | `synack_scratch` | per-CPU array | 0 | one record, transient | 1 |
@@ -390,7 +391,7 @@ index, so new ones are appended:
 | # | Counter | Counted when |
 | ---: | --- | --- |
 | 0 | `EXPECT_FULL` | an expectation insert lost a race (LRU: never for lack of room) |
-| 1 | `ALIAS_FULL` | a third distinct key for one connection |
+| 1 | `ALIAS_FULL` | a second distinct key for one connection |
 | 2 | `COLLISION` | a key already owned by another live registration |
 | 3 | `CAPTURE_FULL` | a capture insert lost a race; the claim is released |
 | 4 | `CAPTURED` | a SYN-ACK stored |
@@ -470,8 +471,15 @@ microbenchmark instead.
 1. **nginx-owned registration by socket cookie** replaces an earlier
    sockops/partial-tuple proposal. It needs no cgroup enrollment, no conntrack
    queries and no external daemon.
-2. **Two keys per SYN** (packet and socket tuple, with ACK S + 1) make capture
-   work across DNAT/SNAT without conntrack.
+2. **One key per SYN: the wire tuple reversed, with ACK S + 1.** It works
+   across DNAT/SNAT without conntrack, because the last hook out and the first
+   hook in both see the same, NATed form. A second key built from the socket's
+   own tuple used to cover backends in nginx's own namespace reached through
+   OUTPUT NAT, whose replies come back already un-NATed. It was dropped:
+   fingerprinting the host's own stack through its own NAT says little, and the
+   second key cost an extra map insert and four CO-RE reads on every new
+   connection (`synack_out` per registered SYN, median 1,487 → 925 ns on the
+   test VM). It also halved `synack_expect` to 65,536 entries.
 3. **A committed skeleton** means building nginx needs libbpf but no BPF
    toolchain. `gen-skel.sh` is byte-identical wherever it runs: it compiles a
    copy of the inputs by relative paths in a fixed-length directory, because
@@ -518,6 +526,9 @@ microbenchmark instead.
 - **Linear headers only.** Only IP/TCP headers in the linear part of the socket
   buffer are read. Drivers that leave the TCP header in page fragments at
   PREROUTING produce no capture; the request still succeeds with an empty value.
+- **Same-namespace NAT.** An upstream in nginx's own network namespace reached
+  through OUTPUT DNAT, REDIRECT or SNAT is not captured; its reply comes back
+  already un-NATed. Without NAT, local upstreams are captured.
 - **Early rewrites.** XDP, TC, OUTPUT and other-namespace rewrites made before
   early PREROUTING cannot be undone. Arbitrary TCP sequence rewriting is not
   supported.

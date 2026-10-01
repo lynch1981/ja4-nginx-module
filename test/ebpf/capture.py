@@ -20,7 +20,7 @@ from fixture import Loader, Tap, Tuple, namespace, remote_backend, rules, skelet
 
 class Connection(C.Structure):
     _fields_ = [("phase", C.c_uint32),
-                ("count", C.c_uint32), ("keys", Tuple * 2)]
+                ("count", C.c_uint32), ("keys", Tuple * 1)]
 
 
 class Expectation(C.Structure):
@@ -204,27 +204,27 @@ class Collector:
         outgoing = key(src="127.0.0.2", dst="127.0.0.1", sport=40100, dport=40101, ack=0)
         reply = key(src="127.0.0.1", dst="127.0.0.2", sport=40101, dport=40100, ack=101)
         try:
-            # Wire tuple plus the raw socket's own tuple: exactly two keys.
+            # One key: the wire tuple reversed, ACK S+1.
             self.send(outgoing, packet(outgoing, flags=2))
             state = self.get("conn", cookie, Connection)
-            assert state.count == 2, state.count
+            assert state.count == 1 and bytes(state.keys[0]) == bytes(reply), state.count
             # nginx never sends SYN data upstream: a SYN carrying data adds no
             # S+1+N key, and a SYN-ACK acknowledging the data does not match.
             self.send(outgoing, packet(outgoing, flags=2, payload=b"hello"))
-            assert self.get("conn", cookie, Connection).count == 2
+            assert self.get("conn", cookie, Connection).count == 1
             data_ack = key(src="127.0.0.1", dst="127.0.0.2", sport=40101, dport=40100, ack=106)
             self.send(data_ack, packet(data_ack))
             assert self.get("capture", cookie, Record) is None
             # A retransmitted SYN keeps the same keys.
             self.send(outgoing, packet(outgoing, flags=2))
             newer = self.get("conn", cookie, Connection)
-            assert newer.count == 2 and bytes(newer.keys) == bytes(state.keys)
+            assert newer.count == 1 and bytes(newer.keys) == bytes(state.keys)
             for k in newer.keys:
                 assert self.get("expect", k, Expectation).cookie == cookie.value
-            # A SYN with another sequence number cannot add more aliases.
+            # A SYN with another sequence number cannot add a second key.
             previous = self.counter(1)
             self.send(outgoing, packet(outgoing, flags=2, seq=999))
-            assert self.get("conn", cookie, Connection).count == 2
+            assert self.get("conn", cookie, Connection).count == 1
             assert self.counter(1) > previous
             self.send(reply, packet(reply))
             assert self.get("capture", cookie, Record, consume=True)
@@ -259,8 +259,8 @@ class Collector:
 
     def tcp_case(self, name, address, expected_source, aliases):
         with self.tap.case("production " + name):
-            # A missed capture leaves the registration with the keys the SYN
-            # added: the wire tuple, plus the socket tuple when NAT changed it.
+            # A missed capture leaves the registration with the one key the
+            # SYN added: its wire tuple reversed, across NAT as well.
             with self.tcp(address, hold=True) as cookie:
                 state = self.get("conn", cookie, Connection)
                 assert state.phase == 0 and state.count == aliases, (name, state.count)
@@ -306,7 +306,7 @@ class Collector:
                 if post:
                     body += f"chain post {{ type nat hook postrouting priority srcnat; {post}; }}\n"
                 with rules(body):
-                    self.tcp_case(name, address, original, 2)
+                    self.tcp_case(name, address, original, 1)
 
     def collisions(self):
         outgoing = key(src="127.0.0.2", dst="127.0.0.1", sport=40200, dport=40201, ack=0)

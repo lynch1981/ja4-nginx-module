@@ -64,7 +64,7 @@ Each case belongs to the lowest layer that can observe it.
   - crafted packets: payload exclusion, IPv4 options, IPv6 extension limits,
     fragments, jumbograms, ESP, bad TCP offsets, RST, and non-SYN-ACK flags
     (ACK, SYN, data, FIN, RST) on a registered key, over IPv4 and IPv6
-  - SYN-data ACK misses, retransmission alias retention, terminal state,
+  - SYN-data ACK misses, retransmitted SYNs keeping their key, terminal state,
     colliding ownership, and ACK wraparound
   - eviction from all three LRU maps when overfilled to twice their capacity,
     and a key whose owner is gone taken over by its next owner
@@ -94,8 +94,10 @@ Each case belongs to the lowest layer that can observe it.
 - **`ja4ts-network.t`: network paths through Nginx.** It has 61 assertions
   covering:
   - IPv6
-  - DNAT, SNAT, REDIRECT and their combinations, including IPv6 and a
-    non-local address
+  - DNAT, SNAT, REDIRECT and their combinations to an upstream in nginx's own
+    namespace, including IPv6 and a non-local address: deliberately not
+    captured, and the request is unaffected (remote NAT is covered by
+    `capture.py`)
   - NATed and direct connections in turn
   - later PREROUTING rewrites and untracked traffic
   Both files share `test/lib/Ja4tsCapture.pm`: the private namespace and the
