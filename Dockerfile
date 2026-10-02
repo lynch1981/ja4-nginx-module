@@ -39,6 +39,7 @@ COPY config /tmp/ja4-nginx-module/config
 COPY src/ngx_http_ssl_ja4_module.c.dummy /tmp/ja4-nginx-module/src/ngx_http_ssl_ja4_module.c
 COPY src/ngx_http_ja4t.c.dummy /tmp/ja4-nginx-module/src/ngx_http_ja4t.c
 COPY src/ngx_ssl_ja4_client_hello.c.dummy /tmp/ja4-nginx-module/src/ngx_ssl_ja4_client_hello.c
+COPY src/ngx_ssl_ja4.c.dummy /tmp/ja4-nginx-module/src/ngx_ssl_ja4.c
 COPY patches/nginx-tcp-save-syn.patch /tmp/ja4-nginx-module/patches/nginx-tcp-save-syn.patch
 
 WORKDIR /tmp/nginx-${NGINX_VERSION}
