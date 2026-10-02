@@ -15,6 +15,18 @@ The module requires rebuilding nginx with the [ClientHello capture patch](patche
 
 JA4 and JA4one require TLS and are empty on plain HTTP. JA4H works with both HTTP and HTTPS; JA4T is independent of TLS.
 
+### Stream
+
+When nginx is built with `--with-stream`, the module also adds stream variables. JA4 and JA4one need `--with-stream_ssl_module` and a `listen ... ssl` server, because the fingerprint is read from the TLS handshake that nginx terminates. With `ssl_preread` passthrough they are empty.
+
+| Fingerprint | Stream variables |
+| --- | --- |
+| JA4 | `$stream_ssl_ja4`, `$stream_ssl_ja4_string` |
+| JA4one | `$stream_ssl_ja4one` |
+| JA4T | `$stream_ssl_ja4t`, `$stream_ssl_ja4t_string` |
+
+The values match the HTTP variables for the same client. JA4H has no stream equivalent.
+
 ## Quick start
 
 The root [Dockerfile](Dockerfile) and [Compose configuration](docker-compose.yaml) provide a development/reference environment. Make sure Docker Compose and OpenSSL are installed, and ports 80 and 443 are available.
@@ -50,12 +62,13 @@ patch -p1 < "$ja4_module_dir/patches/nginx-ssl-save-client-hello.patch"
 # Optional: include this patch if you need JA4T.
 patch -p1 < "$ja4_module_dir/patches/nginx-tcp-save-syn.patch"
 ./configure --add-module="$ja4_module_dir" \
-    --with-http_ssl_module --with-http_v2_module
+    --with-http_ssl_module --with-http_v2_module \
+    --with-stream --with-stream_ssl_module  # optional: stream variables
 make
 make install
 ```
 
-Add your usual nginx configure options, such as `--prefix`, as needed. Without the SYN capture patch, the module still builds, but JA4T returns no value and the `tcp_save_syn` directive is unavailable.
+Add your usual nginx configure options, such as `--prefix`, as needed. With `--add-dynamic-module`, the build produces `ngx_http_ssl_ja4_module.so` and, when stream is enabled, `ngx_stream_ssl_ja4_module.so`; load whichever you use. Without the SYN capture patch, the module still builds, but JA4T returns no value and the `tcp_save_syn` directive is unavailable.
 
 ## Configuration
 
@@ -73,6 +86,24 @@ http {
         ssl_certificate /path/to/server.crt;
         ssl_certificate_key /path/to/server.key;
         access_log logs/access.log fingerprints;
+    }
+}
+```
+
+The stream equivalent:
+
+```nginx
+stream {
+    log_format fingerprints '$remote_addr ja4=$stream_ssl_ja4 '
+                            'ja4one=$stream_ssl_ja4one ja4t=$stream_ssl_ja4t';
+
+    server {
+        listen 8443 ssl;
+        tcp_save_syn on; # Requires the optional SYN capture patch.
+        ssl_certificate /path/to/server.crt;
+        ssl_certificate_key /path/to/server.key;
+        access_log logs/stream.log fingerprints;
+        proxy_pass backend:8443;
     }
 }
 ```
@@ -97,9 +128,9 @@ Run both suites from the repository root. The [CI workflows](.github/workflows) 
 
 ### Test::Nginx
 
-The Perl suite (`test/*.t`) checks module loading, variable behavior on plain HTTP, JA4H request fingerprints, TLS ClientHello cases and JA4T SYN fingerprints.
+The Perl suite (`test/*.t`) checks module loading, variable behavior on plain HTTP, JA4H request fingerprints, TLS ClientHello cases, stream variables and JA4T SYN fingerprints.
 
-Use nginx built with both patches and HTTP/2 support. Install [Test::Nginx](https://github.com/openresty/test-nginx) with `cpanm`, and build [curlu](https://github.com/lynch1981/curlu) with Go 1.24.0 using the curlu version pinned in [CI](.github/workflows/test-nginx.yaml). Its `curl` wrapper must be on `PATH` for the TLS and JA4T cases.
+Use nginx built with both patches, HTTP/2 and stream SSL support. Install [Test::Nginx](https://github.com/openresty/test-nginx) with `cpanm`, and build [curlu](https://github.com/lynch1981/curlu) with Go 1.24.0 using the curlu version pinned in [CI](.github/workflows/test-nginx.yaml). Its `curl` wrapper must be on `PATH` for the TLS, stream and JA4T cases.
 
 ```bash
 cpanm --local-lib="$HOME/perl5" Test::Nginx

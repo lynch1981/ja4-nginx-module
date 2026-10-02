@@ -109,6 +109,8 @@ jobs:
             --add-module="${GITHUB_WORKSPACE}" \
             --with-http_ssl_module \
             --with-http_v2_module \
+            --with-stream \
+            --with-stream_ssl_module \
             || { echo "::error::nginx configure failed"; cat objs/autoconf.err; exit 1; }
           sed -i \
             -e "s|^CFLAGS *=|CFLAGS = ${{ matrix.cc_sanitize }} |" \
@@ -124,14 +126,14 @@ jobs:
         run: |
           set -euo pipefail
           export TEST_NGINX_BINARY="${BUILD_DIR}/nginx-${NGINX_VERSION}/objs/nginx"
-          prove -v $(ls test/*.t | grep -Ev '/(ja4t|tls-ja4)-variables\.t$')
+          prove -v $(ls test/*.t | grep -Ev '/(ja4t|tls-ja4|stream-ja4)-variables\.t$')
 
       - name: Run TLS JA4 tests (curlu)
         run: |
           set -euo pipefail
           export PATH="${BUILD_DIR}/curlu-${CURLU_VERSION}:${PATH}"
           export TEST_NGINX_BINARY="${BUILD_DIR}/nginx-${NGINX_VERSION}/objs/nginx"
-          prove -v test/tls-ja4-variables.t
+          prove -v test/tls-ja4-variables.t test/stream-ja4-variables.t
 
       # Run last: curlu crafts SYN packets using root-only network operations.
       - name: Run JA4T tests (root)
