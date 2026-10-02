@@ -68,7 +68,14 @@ make
 make install
 ```
 
-Add your usual nginx configure options, such as `--prefix`, as needed. With `--add-dynamic-module`, the build produces `ngx_http_ssl_ja4_module.so` and, when stream is enabled, `ngx_stream_ssl_ja4_module.so`; load whichever you use. Without the SYN capture patch, the module still builds, but JA4T returns no value and the `tcp_save_syn` directive is unavailable.
+Add your usual nginx configure options, such as `--prefix`, as needed. Without the SYN capture patch, the module still builds, but JA4T returns no value and the `tcp_save_syn` directive is unavailable.
+
+To build dynamic modules instead, replace `--add-module` with `--add-dynamic-module`. The build produces `ngx_http_ssl_ja4_module.so` and, when stream is enabled, `ngx_stream_ssl_ja4_module.so`. Each one works on its own, so load only the ones you use at the top of `nginx.conf`:
+
+```nginx
+load_module modules/ngx_http_ssl_ja4_module.so;    # $http_ssl_ja4* variables
+load_module modules/ngx_stream_ssl_ja4_module.so;  # $stream_ssl_ja4* variables
+```
 
 ## Configuration
 
